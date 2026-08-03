@@ -5,9 +5,13 @@ import { DatabaseSync } from "node:sqlite";
 import mqtt from "mqtt";
 
 const PORT = Number(process.env.GAME_SERVER_PORT || 3001);
-const HOST = process.env.GAME_SERVER_HOST || "0.0.0.0";
+// The browser reaches this service through the Next.js same-origin proxy. Keep
+// the database API private to this machine unless an operator explicitly opts
+// into LAN access with GAME_SERVER_HOST.
+const HOST = process.env.GAME_SERVER_HOST || "127.0.0.1";
 const MQTT_URL = process.env.MQTT_URL || "mqtt://192.168.18.129:1883";
 const MQTT_TOPIC = process.env.MQTT_TOPIC || "tommytv/scoreboard";
+const SCOREBOARD_STALE_MS = Number(process.env.SCOREBOARD_STALE_MS || 10_000);
 const DB_PATH = resolve(process.env.GAME_DB_PATH || "data/tommytv-game.sqlite");
 
 mkdirSync(dirname(DB_PATH), { recursive: true });
@@ -52,6 +56,9 @@ const playColumns = db.prepare("PRAGMA table_info(play)").all().map((column) => 
 if (!playColumns.includes("team")) {
   db.exec("ALTER TABLE play ADD COLUMN team TEXT NOT NULL DEFAULT 'home'");
 }
+if (!playColumns.includes("passer_number")) db.exec("ALTER TABLE play ADD COLUMN passer_number TEXT");
+if (!playColumns.includes("receiver_number")) db.exec("ALTER TABLE play ADD COLUMN receiver_number TEXT");
+if (!playColumns.includes("pass_result")) db.exec("ALTER TABLE play ADD COLUMN pass_result TEXT");
 
 db.prepare(`
   INSERT OR IGNORE INTO game
@@ -76,7 +83,7 @@ function rowsToRoster(team) {
 function readState() {
   const game = db.prepare("SELECT * FROM game WHERE id = 1").get();
   const plays = db.prepare(
-    "SELECT id, clock, situation, description, tag, status, team, play_type, player_number, yards, details_json FROM play ORDER BY id"
+    "SELECT id, clock, situation, description, tag, status, team, play_type, player_number, passer_number, receiver_number, pass_result, yards, details_json FROM play ORDER BY id"
   ).all().map((play) => ({
     id: Number(play.id),
     clock: String(play.clock),
@@ -87,6 +94,9 @@ function readState() {
     team: String(play.team),
     playType: String(play.play_type),
     playerNumber: String(play.player_number),
+    passerNumber: play.passer_number == null ? undefined : String(play.passer_number),
+    receiverNumber: play.receiver_number == null ? undefined : String(play.receiver_number),
+    passResult: play.pass_result == null ? undefined : String(play.pass_result),
     yards: Number(play.yards),
     details: JSON.parse(String(play.details_json || "{}")),
   }));
@@ -113,7 +123,7 @@ function currentScoreboard() {
     : 0;
   return {
     ...scoreboard,
-    stale: !scoreboard.connected || !receivedAt || Date.now() - receivedAt > 10_000,
+    stale: !scoreboard.connected || !receivedAt || Date.now() - receivedAt > SCOREBOARD_STALE_MS,
   };
 }
 
@@ -125,7 +135,6 @@ function broadcast() {
 function json(response, status, value) {
   response.writeHead(status, {
     "Content-Type": "application/json; charset=utf-8",
-    "Access-Control-Allow-Origin": "*",
     "Cache-Control": "no-store",
   });
   response.end(JSON.stringify(value));
@@ -180,16 +189,130 @@ function applyScoreboardPayload(payload) {
   broadcast();
 }
 
-const api = createServer(async (request, response) => {
-  response.setHeader("Access-Control-Allow-Origin", "*");
-  response.setHeader("Access-Control-Allow-Headers", "Content-Type");
-  response.setHeader("Access-Control-Allow-Methods", "GET, POST, PUT, DELETE, OPTIONS");
-  if (request.method === "OPTIONS") {
-    response.writeHead(204);
-    response.end();
-    return;
+const PASS_RESULTS = new Set(["Complete", "Incomplete", "Sacked", "Interception"]);
+const SPECIAL_RESULTS = {
+  Punt: new Set(["Returned", "Fair catch", "Touchback", "Downed", "Out of bounds", "Blocked"]),
+  Kickoff: new Set(["Returned", "Touchback", "Out of bounds", "Onside kicking team", "Onside receiving team"]),
+  "Field goal": new Set(["Made", "Missed", "Blocked"]),
+  Try: new Set(["Made", "Failed"]),
+};
+
+function cleanPlay(body) {
+  const team = body.team === "away" ? "away" : "home";
+  const playType = String(body.playType || "");
+  const playerNumber = String(body.playerNumber || "").trim();
+  const passerNumber = String(body.passerNumber || "").trim();
+  const receiverNumber = String(body.receiverNumber || "").trim();
+  const passResult = String(body.passResult || "").trim();
+  let yards = Number(body.yards || 0);
+  const incomingDetails = body.details && typeof body.details === "object" && !Array.isArray(body.details) ? body.details : {};
+  const details = { ...incomingDetails };
+  if (!Number.isFinite(yards) || !Number.isInteger(yards)) throw new Error("Yards must be a whole number");
+
+  const rosterHas = (number) => Boolean(number) && Boolean(db.prepare(
+    "SELECT 1 FROM roster WHERE team = ? AND number = ? LIMIT 1"
+  ).get(team, number));
+  const rosterName = (number) => String(db.prepare(
+    "SELECT name FROM roster WHERE team = ? AND number = ? ORDER BY sort_order LIMIT 1"
+  ).get(team, number)?.name || "");
+  const defense = team === "home" ? "away" : "home";
+  const defenseHas = (number) => Boolean(number) && Boolean(db.prepare(
+    "SELECT 1 FROM roster WHERE team = ? AND number = ? LIMIT 1"
+  ).get(defense, number));
+
+  if (!["Run", "Pass", "Penalty", "Special"].includes(playType)) throw new Error("Choose Run, Pass, Penalty, or Special");
+
+  if (playType === "Pass") {
+    if (!PASS_RESULTS.has(passResult)) throw new Error("Choose Complete, Incomplete, Sacked, or Interception");
+    if (!rosterHas(passerNumber)) throw new Error("Choose a passer from the offensive roster");
+    if (passResult === "Complete" && !rosterHas(receiverNumber)) {
+      throw new Error("A complete pass requires a receiver from the offensive roster");
+    }
+    if (passResult === "Sacked" && yards > 0) throw new Error("Sack yards must be zero or negative");
+    if (passResult !== "Complete" && passResult !== "Sacked" && yards !== 0) throw new Error("Incomplete and intercepted passes must have zero yards");
+    if (passResult !== "Complete" && passResult !== "Sacked") yards = 0;
+  } else if (playType === "Run" && !rosterHas(playerNumber)) {
+    throw new Error("Choose a ball carrier from the offensive roster");
   }
 
+  if (playType === "Penalty") {
+    const penalty = details.penalty || {};
+    if (!['home', 'away'].includes(penalty.team)) throw new Error("Choose the penalized team");
+    const penaltyTeam = penalty.team;
+    const penaltyYards = Number(penalty.yards || 0);
+    const accepted = penalty.accepted !== false;
+    if (accepted && !String(penalty.name || "").trim()) throw new Error("Enter a penalty name");
+    if (!Number.isInteger(penaltyYards) || penaltyYards < 0) throw new Error("Penalty yards must be a non-negative whole number");
+    details.penalty = { team: penaltyTeam, name: String(penalty.name || "").trim(), accepted, yards: penaltyYards, automaticFirstDown: Boolean(penalty.automaticFirstDown), playCounts: Boolean(penalty.playCounts) };
+    yards = 0;
+  }
+
+  if (playType === "Special") {
+    const special = details.specialTeams || {};
+    const subtype = String(special.subtype || "");
+    const result = String(special.result || "");
+    if (!SPECIAL_RESULTS[subtype]?.has(result)) throw new Error("Choose a valid special-teams subtype and result");
+    const actor = String(special.actorNumber || "").trim();
+    const returner = String(special.returnerNumber || "").trim();
+    const distance = Number(special.distance || 0);
+    const returnYards = Number(special.returnYards || 0);
+    if (result === "Returned" && !defenseHas(returner)) throw new Error("Choose a returner from the receiving roster");
+    if (![distance, returnYards].every(Number.isInteger) || distance < 0 || returnYards < 0) throw new Error("Special-teams yards must be non-negative whole numbers");
+    if (subtype === "Try") {
+      const tryType = String(special.tryType || "");
+      if (!["PAT kick", "Two-point run", "Two-point pass"].includes(tryType)) throw new Error("Choose a valid try type");
+      if (tryType === "PAT kick" && !rosterHas(actor)) throw new Error("Choose a kicker for the PAT");
+      if (tryType === "Two-point run" && !rosterHas(actor)) throw new Error("Choose a runner for the two-point try");
+      if (tryType === "Two-point pass" && (!rosterHas(String(special.passerNumber || "").trim()) || !rosterHas(String(special.receiverNumber || "").trim()))) throw new Error("Choose a passer and receiver for the two-point try");
+    } else if (!rosterHas(actor)) {
+      throw new Error(`Choose a ${subtype === "Punt" ? "punter" : "kicker"} from the offensive roster`);
+    }
+    if (subtype === "Field goal" && distance <= 0) throw new Error("Enter a valid field-goal distance");
+    const tryType = subtype === "Try" ? String(special.tryType) : undefined;
+    details.specialTeams = {
+      subtype, result,
+      actorNumber: subtype !== "Try" || tryType !== "Two-point pass" ? actor : "",
+      returnerNumber: result === "Returned" ? returner : "",
+      distance: subtype === "Punt" || subtype === "Field goal" ? distance : 0,
+      returnYards: result === "Returned" ? returnYards : 0,
+      returnTouchdown: result === "Returned" && Boolean(special.returnTouchdown),
+      ...(tryType ? { tryType } : {}),
+      ...(tryType === "Two-point pass" ? { passerNumber: String(special.passerNumber).trim(), receiverNumber: String(special.receiverNumber).trim() } : {}),
+    };
+    yards = 0;
+  }
+
+  const turnover = details.turnoverDetail || {};
+  if (turnover.interceptorNumber && !defenseHas(String(turnover.interceptorNumber))) throw new Error("Interceptor must be on the defensive roster");
+  if (turnover.recovererNumber && !defenseHas(String(turnover.recovererNumber))) throw new Error("Recoverer must be on the defensive roster");
+
+  const description = playType === "Pass"
+    ? passResult === "Complete"
+      ? `#${passerNumber} ${rosterName(passerNumber)} complete to #${receiverNumber} ${rosterName(receiverNumber)} for ${yards} yards`
+      : passResult === "Sacked"
+        ? `#${passerNumber} ${rosterName(passerNumber)} sacked ${yards < 0 ? `for a loss of ${Math.abs(yards)} yards` : "for no gain"}`
+        : `#${passerNumber} ${rosterName(passerNumber)} ${passResult === "Incomplete" ? "pass incomplete" : "intercepted"}`
+    : playType === "Run"
+      ? `#${playerNumber} ${rosterName(playerNumber)} rush for ${yards} yards${body.tag === "TOUCHDOWN" ? " · touchdown" : body.tag === "FUMBLE LOST" ? " · fumble lost" : ""}`
+      : playType === "Penalty"
+        ? `${details.penalty.accepted ? "Accepted" : "Declined"} ${details.penalty.name} penalty on ${details.penalty.team === "home" ? "home" : "away"}${details.penalty.accepted ? ` for ${details.penalty.yards} yards` : ""}${details.penalty.automaticFirstDown ? " · automatic first down" : ""}`
+        : details.specialTeams.subtype === "Try"
+          ? details.specialTeams.tryType === "PAT kick"
+            ? `#${details.specialTeams.actorNumber} PAT ${details.specialTeams.result === "Made" ? "good" : "failed"}`
+            : details.specialTeams.tryType === "Two-point run"
+              ? `#${details.specialTeams.actorNumber} two-point run ${details.specialTeams.result === "Made" ? "successful" : "failed"}`
+              : `#${details.specialTeams.passerNumber} pass to #${details.specialTeams.receiverNumber} for ${details.specialTeams.result === "Made" ? "successful" : "failed"} two-point conversion`
+          : `${details.specialTeams.subtype}: #${details.specialTeams.actorNumber} ${rosterName(details.specialTeams.actorNumber)} · ${details.specialTeams.result.toLowerCase()}${details.specialTeams.distance ? ` · ${details.specialTeams.distance} yards` : ""}${details.specialTeams.returnerNumber ? ` · #${details.specialTeams.returnerNumber} return for ${details.specialTeams.returnYards} yards` : ""}`;
+  return {
+    team, playType, playerNumber,
+    passerNumber: playType === "Pass" ? passerNumber : "",
+    receiverNumber: playType === "Pass" && (passResult === "Complete" || passResult === "Incomplete") ? receiverNumber : "",
+    passResult: playType === "Pass" ? passResult : "",
+    yards, description, details,
+  };
+}
+
+const api = createServer(async (request, response) => {
   const url = new URL(request.url || "/", `http://${request.headers.host || "localhost"}`);
 
   try {
@@ -210,7 +333,6 @@ const api = createServer(async (request, response) => {
         "Content-Type": "text/event-stream",
         "Cache-Control": "no-cache",
         Connection: "keep-alive",
-        "Access-Control-Allow-Origin": "*",
       });
       response.write(`event: state\ndata: ${JSON.stringify(readState())}\n\n`);
       eventClients.add(response);
@@ -244,21 +366,19 @@ const api = createServer(async (request, response) => {
     }
     if (request.method === "POST" && url.pathname === "/api/plays") {
       const body = await readJson(request);
-      if (!String(body.description || "").trim()) throw new Error("Play description is required");
+      const play = cleanPlay(body);
       const now = new Date().toISOString();
       const result = db.prepare(`
         INSERT INTO play
-        (clock, situation, description, tag, status, team, play_type, player_number, yards, details_json, created_at, updated_at)
-        VALUES (?, ?, ?, ?, 'logged', ?, ?, ?, ?, '{}', ?, ?)
+        (clock, situation, description, tag, status, team, play_type, player_number, passer_number, receiver_number, pass_result, yards, details_json, created_at, updated_at)
+        VALUES (?, ?, ?, ?, 'logged', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
       `).run(
         String(body.clock || currentScoreboard().payload.clock || ""),
         String(body.situation || ""),
-        String(body.description).trim(),
+        play.description,
         body.tag ? String(body.tag) : null,
-        body.team === "away" ? "away" : "home",
-        String(body.playType || ""),
-        String(body.playerNumber || ""),
-        Number(body.yards || 0),
+        play.team, play.playType, play.playerNumber, play.passerNumber || null,
+        play.receiverNumber || null, play.passResult || null, play.yards, JSON.stringify(play.details),
         now,
         now,
       );
@@ -269,40 +389,72 @@ const api = createServer(async (request, response) => {
     const playMatch = url.pathname.match(/^\/api\/plays\/(\d+)$/);
     if (playMatch && request.method === "PUT") {
       const body = await readJson(request);
-      db.prepare(`
-        UPDATE play SET clock = ?, situation = ?, description = ?, tag = ?, updated_at = ? WHERE id = ?
+      const play = cleanPlay(body);
+      const existing = db.prepare("SELECT details_json FROM play WHERE id = ?").get(Number(playMatch[1]));
+      if (!existing) throw new Error("Play not found");
+      const existingDetails = JSON.parse(String(existing.details_json || "{}"));
+      const mergedDetails = { ...existingDetails, ...play.details };
+      const result = db.prepare(`
+        UPDATE play
+        SET clock = ?, situation = ?, description = ?, tag = ?, team = ?, play_type = ?,
+            player_number = ?, passer_number = ?, receiver_number = ?, pass_result = ?, yards = ?, details_json = ?, updated_at = ?
+        WHERE id = ?
       `).run(
         String(body.clock || ""),
         String(body.situation || ""),
-        String(body.description || "").trim(),
+        play.description,
         body.tag ? String(body.tag) : null,
+        play.team, play.playType, play.playerNumber, play.passerNumber || null,
+        play.receiverNumber || null, play.passResult || null, play.yards, JSON.stringify(mergedDetails),
         new Date().toISOString(),
         Number(playMatch[1]),
       );
+      if (!result.changes) throw new Error("Play not found");
       broadcast();
       json(response, 200, readState());
       return;
     }
     if (playMatch && request.method === "DELETE") {
-      db.prepare("DELETE FROM play WHERE id = ?").run(Number(playMatch[1]));
+      const result = db.prepare("DELETE FROM play WHERE id = ?").run(Number(playMatch[1]));
+      if (!result.changes) throw new Error("Play not found");
       broadcast();
-      response.writeHead(204, { "Access-Control-Allow-Origin": "*" });
+      response.writeHead(204);
       response.end();
       return;
     }
     const confirmMatch = url.pathname.match(/^\/api\/plays\/(\d+)\/confirm$/);
     if (confirmMatch && request.method === "POST") {
       const body = await readJson(request);
-      db.prepare(`
+      const existingPlay = db.prepare("SELECT team, details_json FROM play WHERE id = ?").get(Number(confirmMatch[1]));
+      if (!existingPlay) throw new Error("Play not found");
+      const defensiveTeam = existingPlay.team === "home" ? "away" : "home";
+      const defensiveNumbers = new Set(rowsToRoster(defensiveTeam).map((row) => row[0]));
+      const selectedDefenders = [
+        ...(Array.isArray(body.tacklers) ? body.tacklers : []),
+        body.defensiveCredits?.primary,
+        ...(Array.isArray(body.defensiveCredits?.assists) ? body.defensiveCredits.assists : []),
+        ...(Array.isArray(body.defensiveCredits?.sack) ? body.defensiveCredits.sack : []),
+        ...(Array.isArray(body.defensiveCredits?.tackleForLoss) ? body.defensiveCredits.tackleForLoss : []),
+        body.defensiveCredits?.forcedFumble,
+        body.defensiveCredits?.passBreakup,
+        body.turnoverDetail?.interceptorNumber,
+        body.turnoverDetail?.recovererNumber,
+      ].filter(Boolean).map(String);
+      if (selectedDefenders.some((number) => !defensiveNumbers.has(number))) throw new Error("Defensive detail player must be on the opposing roster");
+      const result = db.prepare(`
         UPDATE play SET status = 'confirmed', details_json = ?, updated_at = ? WHERE id = ?
       `).run(
         JSON.stringify({
+          ...JSON.parse(String(existingPlay.details_json || "{}")),
           tacklers: Array.isArray(body.tacklers) ? body.tacklers : [],
           flags: Array.isArray(body.flags) ? body.flags : [],
+          defensiveCredits: body.defensiveCredits && typeof body.defensiveCredits === "object" ? body.defensiveCredits : undefined,
+          turnoverDetail: body.turnoverDetail && typeof body.turnoverDetail === "object" ? body.turnoverDetail : undefined,
         }),
         new Date().toISOString(),
         Number(confirmMatch[1]),
       );
+      if (!result.changes) throw new Error("Play not found");
       broadcast();
       json(response, 200, readState());
       return;
@@ -360,7 +512,18 @@ mqttClient.on("error", (error) => {
   if (process.env.NODE_ENV !== "test") console.error(`MQTT: ${error.message}`);
 });
 
+// Staleness changes with time, not with an incoming message. Broadcast when a
+// previously live feed crosses the threshold so every open iPad updates.
+const staleTimer = setInterval(() => {
+  if (scoreboard.connected && !scoreboard.stale && currentScoreboard().stale) {
+    scoreboard.stale = true;
+    broadcast();
+  }
+}, Math.max(1_000, Math.min(SCOREBOARD_STALE_MS, 5_000)));
+staleTimer.unref();
+
 function shutdown() {
+  clearInterval(staleTimer);
   mqttClient.end(true);
   for (const response of eventClients) response.end();
   api.closeAllConnections();

@@ -122,16 +122,31 @@ h2 { margin-bottom: 0; font-size: 20px; letter-spacing: -.4px; }
 .segmented button.selected, .quick-flags button.selected, .detail-flags button.selected {
   border-color: var(--orange); background: rgba(255, 91, 46, .17); color: #fff;
 }
-.player-grid { display: grid; grid-template-columns: repeat(3, 1fr); gap: 8px; margin: 7px 0 20px; }
+.player-selection { display: grid; grid-template-columns: minmax(190px, 23%) 1fr; gap: 12px; margin: 7px 0 20px; }
+.jersey-selector { padding: 10px; border: 1px solid var(--line); border-radius: 10px; background: #091a2d; }
+.jersey-display { display: grid; grid-template-columns: 1fr auto; align-items: center; min-height: 42px; margin-bottom: 8px; }
+.jersey-display span { color: var(--muted); font-size: 8px; font-weight: 900; letter-spacing: 1px; }
+.jersey-display strong { grid-row: span 2; color: var(--orange-2); font-size: 28px; line-height: 1; }
+.jersey-display small { color: var(--muted); font-size: 9px; }
+.number-pad { display: grid; grid-template-columns: repeat(3, 1fr); gap: 5px; }
+.number-pad button { min-height: 35px; border: 1px solid var(--line); border-radius: 7px; background: #102741; color: #fff; font-size: 15px; font-weight: 850; }
+.number-pad button:active { border-color: var(--orange); background: rgba(255,91,46,.2); }
+.number-pad button.utility { color: var(--muted); font-size: 8px; letter-spacing: .3px; }
+.quick-player-area { min-width: 0; }
+.quick-player-head { display: flex; align-items: center; justify-content: space-between; min-height: 31px; margin-bottom: 6px; }
+.quick-player-head small { color: var(--muted); font-size: 8px; font-weight: 900; letter-spacing: 1px; }
+.quick-player-head button { min-height: 31px; padding: 0 12px; border: 1px solid var(--line); border-radius: 7px; background: transparent; color: #fff; font-size: 9px; font-weight: 850; }
+.quick-player-head button span { margin-left: 6px; color: var(--orange-2); }
+.player-grid { display: grid; grid-template-columns: repeat(4, minmax(0, 1fr)); gap: 7px; }
 .player {
-  min-height: 66px; display: grid; grid-template-columns: 47px 1fr auto; align-items: center;
-  text-align: left; padding: 8px 11px; border-radius: 9px; border: 1px solid var(--line); background: #0d2035;
+  min-height: 62px; display: grid; grid-template-columns: 41px 1fr; align-items: center;
+  text-align: left; padding: 7px 9px; border-radius: 9px; border: 1px solid var(--line); background: #0d2035;
 }
 .player b { font-size: 17px; color: var(--orange-2); }
-.player span { font-size: 12px; font-weight: 750; }
-.player small { font-size: 9px; color: var(--muted); }
+.player span { min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; font-size: 11px; font-weight: 750; }
+.player small { grid-column: 2; min-width: 0; color: var(--muted); font-size: 8px; }
 .player.selected { background: rgba(255, 91, 46, .14); border-color: var(--orange); box-shadow: inset 3px 0 var(--orange); }
-.player.more { display: flex; flex-direction: column; justify-content: center; align-items: center; text-align: center; }
+.player.matching { border-color: #4ea2d9; background: rgba(78,162,217,.12); }
 .result-row { display: grid; grid-template-columns: 192px 1fr; gap: 14px; align-items: end; }
 .result-row > label > span:first-child { display: block; margin-bottom: 5px; color: var(--muted); font-size: 9px; letter-spacing: 1px; font-weight: 800; }
 .yard-control { display: grid; grid-template-columns: 48px 1fr 48px; height: 58px; }
@@ -298,6 +313,14 @@ h2 { margin-bottom: 0; font-size: 20px; letter-spacing: -.4px; }
 .roster-preview b { color: var(--orange-2); }
 .roster-preview span { font-size: 12px; font-weight: 750; }
 .roster-preview small { color: var(--muted); text-align: right; }
+.roster-picker-modal { width: min(940px, 100%); }
+.roster-search { margin: 12px 0 14px !important; }
+.full-roster-grid { display: grid; grid-template-columns: repeat(4, minmax(0, 1fr)); gap: 8px; }
+.roster-player { min-height: 68px; display: grid; grid-template-columns: 48px 1fr; align-items: center; padding: 9px 11px; border: 1px solid var(--line); border-radius: 9px; background: #0d2035; color: #fff; text-align: left; }
+.roster-player b { grid-row: span 2; color: var(--orange-2); font-size: 18px; }
+.roster-player span { min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; font-size: 11px; font-weight: 800; }
+.roster-player small { color: var(--muted); font-size: 8px; }
+.roster-player.selected { border-color: var(--orange); background: rgba(255,91,46,.14); box-shadow: inset 3px 0 var(--orange); }
 .toast {
   position: fixed; z-index: 150; left: 50%; bottom: 28px; transform: translateX(-50%);
   min-width: 280px; max-width: calc(100vw - 30px); padding: 13px 18px;
@@ -308,6 +331,10 @@ h2 { margin-bottom: 0; font-size: 20px; letter-spacing: -.4px; }
 }
 @keyframes toast-in { from { transform: translate(-50%, 10px); opacity: 0; } }
 
+@media (max-width: 1250px) {
+  .entry-workspace { grid-template-columns: 1fr; }
+}
+
 @media (max-width: 1100px) {
   .topbar { grid-template-columns: 1fr auto; }
   .connection { display: none; }
@@ -316,6 +343,9 @@ h2 { margin-bottom: 0; font-size: 20px; letter-spacing: -.4px; }
   .pxp-workspace .comparison { grid-column: 1 / -1; }
   .role-nav { overflow-x: auto; padding-inline: 12px; }
   .role-nav a { min-width: 104px; padding-inline: 12px; }
+  .player-selection { grid-template-columns: 190px 1fr; }
+  .player-grid { grid-template-columns: repeat(4, minmax(0, 1fr)); }
+  .full-roster-grid { grid-template-columns: repeat(3, minmax(0, 1fr)); }
 }
 
 @media (max-width: 700px) {
@@ -330,7 +360,9 @@ h2 { margin-bottom: 0; font-size: 20px; letter-spacing: -.4px; }
   .workspace { padding: 14px 10px 35px; }
   .pxp-workspace { grid-template-columns: 1fr; }
   .pxp-workspace .comparison, .pxp-workspace .play-panel { grid-column: auto; }
+  .player-selection { grid-template-columns: 1fr; }
   .player-grid { grid-template-columns: 1fr 1fr; }
+  .full-roster-grid { grid-template-columns: 1fr 1fr; }
   .result-row { grid-template-columns: 1fr; }
   .save-row { flex-wrap: wrap; }
   .next-state { order: -1; width: 100%; }

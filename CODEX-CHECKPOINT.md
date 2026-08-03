@@ -1,9 +1,57 @@
 # TommyTV Football Stats App — Codex Checkpoint
 
-**Checkpoint date:** July 27, 2026  
+**Checkpoint date:** August 3, 2026
 **Repository:** `https://github.com/AdamVocks79/TommyTV`  
 **Branch:** `main`  
-**Current commit:** `40fb54f` — `Add TommyTV game application with SQLite and MQTT support`
+**Starting main commit for this local test pass:** `e2a6286`
+
+## August 3 local test-readiness pass
+
+The current working tree includes a reliability pass intended for local and
+on-network testing this week:
+
+- full correction of a play's team, type, player, yards, result, description,
+  clock, and situation
+- explicit fumble-lost and interception turnover results
+- preliminary offensive totals exclude penalty and special-team yards
+- working selection for roster players beyond the first five
+- no preselected first down, yardage, or defensive tackler placeholder
+- timed MQTT stale-state broadcasts to every connected client
+- the game/database service binds to `127.0.0.1` by default and no longer sends
+  wildcard CORS headers
+- the web development server binds to `0.0.0.0` so iPads can reach it over LAN
+- stronger backend tests for statistical-field corrections
+- operator-focused README and local startup instructions
+
+The statistics are still a preliminary live-game summary, not a complete NFHS
+statbook. Real MQTT, simultaneous venue iPads, Windows startup, and vMix remain
+field/deployment milestones.
+
+## Issue #1 — landscape player selection
+
+Implemented the large-roster player-selection milestone for the primary-entry
+screen:
+
+- eight touch-friendly quick-player cards prioritized by current selection,
+  recent use, play-type-relevant positions, and jersey number
+- an always-visible on-screen jersey keypad with clear and backspace
+- immediate prefix matching, no-match feedback, and automatic unambiguous
+  selection without opening the iPad keyboard
+- duplicate jersey numbers remain visible and require an explicit name choice
+- a large full-roster modal sorted numerically and filterable by number or name
+- selected players remain visible when quick choices reorder
+- team changes validate the current player and clear temporary selection state
+- reusable player-selection rules with focused tests for sorting, one- and
+  two-digit entries, no matches, duplicates, and positional relevance
+
+Files changed for the milestone include `app/page.tsx`, `app/globals.css`,
+`app/player-selection.ts`, `tests/player-selection.test.mjs`, and the rendered
+integration test. Validation completed with seven passing automated tests,
+lint, a production build, and interactive landscape checks at 1024×768 and
+1180×820. Those checks covered quick-card selection, one-digit keypad
+selection, duplicate/prefix matching, selection outside the quick list through
+the full-roster modal, and switching between home and away rosters. No
+horizontal overflow was observed at either target width.
 
 ## Purpose
 

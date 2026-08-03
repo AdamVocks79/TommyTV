@@ -57,13 +57,14 @@ test("supports direct role shortcut routes", async () => {
 });
 
 test("keeps core interactive workflows in the product source", async () => {
-  const [page, layout, roleRoute, gameRoute, gameServer, packageJson] = await Promise.all([
+  const [page, layout, roleRoute, gameRoute, gameServer, packageJson, viteConfig] = await Promise.all([
     readFile(new URL("../app/page.tsx", import.meta.url), "utf8"),
     readFile(new URL("../app/layout.tsx", import.meta.url), "utf8"),
     readFile(new URL("../app/[...role]/page.tsx", import.meta.url), "utf8"),
     readFile(new URL("../app/api/game/[...path]/route.ts", import.meta.url), "utf8"),
     readFile(new URL("../server/game-server.mjs", import.meta.url), "utf8"),
     readFile(new URL("../package.json", import.meta.url), "utf8"),
+    readFile(new URL("../vite.config.ts", import.meta.url), "utf8"),
   ]);
 
   assert.match(page, /function savePlay\(\)/);
@@ -72,6 +73,12 @@ test("keeps core interactive workflows in the product source", async () => {
   assert.match(page, /Preview away roster/);
   assert.match(page, /setAwayRosterRows/);
   assert.match(page, /Confirm detail/);
+  assert.match(page, /Fumble lost/);
+  assert.match(page, /Jersey number selector/);
+  assert.match(page, /All players/);
+  assert.match(page, /autoSelectedJerseyPlayer/);
+  assert.doesNotMatch(page, /aria-label="More players"/);
+  assert.doesNotMatch(page, /useState\(\["34"\]\)/);
   assert.match(page, /Simulate vMix push/);
   assert.match(page, /GameContext\.Provider/);
   assert.match(page, /apiRequest/);
@@ -81,4 +88,6 @@ test("keeps core interactive workflows in the product source", async () => {
   assert.match(gameServer, /tommytv\/scoreboard/);
   assert.match(gameServer, /DatabaseSync/);
   assert.doesNotMatch(packageJson, /react-loading-skeleton/);
+  assert.match(packageJson, /vinext dev --hostname 0\.0\.0\.0/);
+  assert.doesNotMatch(viteConfig, /import hostingConfig from/);
 });

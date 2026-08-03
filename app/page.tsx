@@ -2,8 +2,18 @@
 
 import { createContext, useCallback, useContext, useEffect, useMemo, useState } from "react";
 import { usePathname } from "next/navigation";
+import { autoSelectedJerseyPlayer, jerseyMatches, positionMatches, samePlayer, sortRoster } from "./player-selection";
+import { calculatePlayerStats, calculateTeamSummary } from "./football-statistics.mjs";
 
 type Role = "entry-primary" | "entry-detail" | "pxp" | "control" | "admin";
+type PassResult = "Complete" | "Incomplete" | "Sacked" | "Interception";
+type PlayDetails = {
+  tacklers?: string[]; flags?: string[];
+  defensiveCredits?: { primary?: string; assists?: string[]; sack?: string[]; tackleForLoss?: string[]; forcedFumble?: string; passBreakup?: string };
+  turnoverDetail?: { interceptorNumber?: string; interceptionReturnYards?: number; returnTouchdown?: boolean; recovererNumber?: string };
+  penalty?: { team: "home" | "away"; name: string; accepted: boolean; yards: number; automaticFirstDown: boolean; playCounts: boolean };
+  specialTeams?: { subtype: string; result: string; actorNumber: string; returnerNumber?: string; distance?: number; returnYards?: number; returnTouchdown?: boolean; tryType?: string; passerNumber?: string; receiverNumber?: string };
+};
 type Play = {
   id: number;
   clock: string;
@@ -13,8 +23,11 @@ type Play = {
   status: "logged" | "confirmed";
   playType?: string;
   playerNumber?: string;
+  passerNumber?: string;
+  receiverNumber?: string;
+  passResult?: PassResult;
   yards?: number;
-  details?: { tacklers?: string[]; flags?: string[] };
+  details?: PlayDetails;
   team?: "home" | "away";
 };
 
@@ -45,10 +58,10 @@ type GameContextValue = {
   backendOnline: boolean;
   saveGame: () => Promise<void>;
   saveRoster: (team: "home" | "away", rows: string[][]) => Promise<void>;
-  createPlay: (play: Omit<Play, "id" | "status"> & { team: "home" | "away"; playType: string; playerNumber: string; yards: number }) => Promise<void>;
-  updatePlay: (play: Play) => Promise<void>;
+  createPlay: (play: Omit<Play, "id" | "status"> & { team: "home" | "away"; playType: string; yards: number }) => Promise<boolean>;
+  updatePlay: (play: Play) => Promise<boolean>;
   deletePlay: (id: number) => Promise<void>;
-  confirmPlay: (id: number, tacklers: string[], flags: string[]) => Promise<void>;
+  confirmPlay: (id: number, detail: PlayDetails) => Promise<boolean>;
   toast: string;
   notify: (message: string) => void;
 };
@@ -175,13 +188,15 @@ function GameProvider({ children }: { children: React.ReactNode }) {
     }
   }
 
-  async function createPlay(play: Omit<Play, "id" | "status"> & { team: "home" | "away"; playType: string; playerNumber: string; yards: number }) {
+  async function createPlay(play: Omit<Play, "id" | "status"> & { team: "home" | "away"; playType: string; yards: number }) {
     try {
       const result = await apiRequest("/api/plays", { method: "POST", body: JSON.stringify(play) });
       applyState(result.state);
       notify(`Play ${result.id} saved to SQLite`);
+      return true;
     } catch (error) {
       notify(error instanceof Error ? error.message : "Could not save play");
+      return false;
     }
   }
 
@@ -190,8 +205,10 @@ function GameProvider({ children }: { children: React.ReactNode }) {
       const state = await apiRequest(`/api/plays/${play.id}`, { method: "PUT", body: JSON.stringify(play) });
       applyState(state);
       notify(`Play ${play.id} corrected`);
+      return true;
     } catch (error) {
       notify(error instanceof Error ? error.message : "Could not update play");
+      return false;
     }
   }
 
@@ -205,16 +222,18 @@ function GameProvider({ children }: { children: React.ReactNode }) {
     }
   }
 
-  async function confirmPlay(id: number, tacklers: string[], flags: string[]) {
+  async function confirmPlay(id: number, detail: PlayDetails) {
     try {
       const state = await apiRequest(`/api/plays/${id}/confirm`, {
         method: "POST",
-        body: JSON.stringify({ tacklers, flags }),
+        body: JSON.stringify(detail),
       });
       applyState(state);
       notify(`Play ${id} defensive detail saved`);
+      return true;
     } catch (error) {
       notify(error instanceof Error ? error.message : "Could not save defensive detail");
+      return false;
     }
   }
 
@@ -356,6 +375,32 @@ function PlayList({
   );
 }
 
+function PlayerSelect({ label, roster, value, onChange, optional = false }: {
+  label: string; roster: string[][]; value?: string; onChange: (number: string) => void; optional?: boolean;
+}) {
+  return (
+    <label><span>{label}</span><select value={value ?? ""} onChange={(event) => onChange(event.target.value)}>
+      <option value="">{optional ? "None selected" : `Choose ${label.toLowerCase()}`}</option>
+      {sortRoster(roster).map((row, index) => <option key={`${row[0]}-${row[1]}-${index}`} value={row[0]}>#{row[0]} {row[1]}{row[2] ? ` · ${row[2]}` : ""}</option>)}
+    </select></label>
+  );
+}
+
+function SpecialCorrectionFields({ play, setPlay, offenseRoster, receivingRoster }: { play: Play; setPlay: (play: Play) => void; offenseRoster: string[][]; receivingRoster: string[][] }) {
+  const current = play.details?.specialTeams ?? { subtype: "Punt", result: "Returned", actorNumber: "" };
+  const update = (changes: Partial<NonNullable<PlayDetails["specialTeams"]>>) => setPlay({ ...play, details: { ...play.details, specialTeams: { ...current, ...changes } } });
+  const results = current.subtype === "Punt" ? ["Returned", "Fair catch", "Touchback", "Downed", "Out of bounds", "Blocked"] : current.subtype === "Kickoff" ? ["Returned", "Touchback", "Out of bounds", "Onside kicking team", "Onside receiving team"] : current.subtype === "Field goal" ? ["Made", "Missed", "Blocked"] : ["Made", "Failed"];
+  const tryType = current.tryType ?? "PAT kick";
+  return <>
+    <label><span>TYPE</span><select value={current.subtype} onChange={(event) => { const subtype = event.target.value; update({ subtype, result: subtype === "Try" || subtype === "Field goal" ? "Made" : "Returned", actorNumber: "", returnerNumber: "", distance: 0, returnYards: 0, returnTouchdown: false, tryType: subtype === "Try" ? "PAT kick" : undefined, passerNumber: "", receiverNumber: "" }); }}><option>Punt</option><option>Kickoff</option><option>Field goal</option><option>Try</option></select></label>
+    {current.subtype === "Try" && <label><span>TRY TYPE</span><select value={tryType} onChange={(event) => update({ tryType: event.target.value, actorNumber: "", passerNumber: "", receiverNumber: "" })}><option>PAT kick</option><option>Two-point run</option><option>Two-point pass</option></select></label>}
+    <label><span>RESULT</span><select value={current.result} onChange={(event) => update({ result: event.target.value, returnerNumber: event.target.value === "Returned" ? current.returnerNumber : "", returnYards: event.target.value === "Returned" ? current.returnYards : 0, returnTouchdown: event.target.value === "Returned" && current.returnTouchdown })}>{results.map((result) => <option key={result}>{result}</option>)}</select></label>
+    {current.subtype === "Try" && tryType === "Two-point pass" ? <><PlayerSelect label="PASSER" roster={offenseRoster} value={current.passerNumber} onChange={(passerNumber) => update({ passerNumber })} /><PlayerSelect label="RECEIVER" roster={offenseRoster} value={current.receiverNumber} onChange={(receiverNumber) => update({ receiverNumber })} /></> : <PlayerSelect label={current.subtype === "Punt" ? "PUNTER" : current.subtype === "Try" && tryType === "Two-point run" ? "RUNNER" : "KICKER"} roster={offenseRoster} value={current.actorNumber} onChange={(actorNumber) => update({ actorNumber })} />}
+    {(current.subtype === "Punt" || current.subtype === "Field goal") && <label><span>DISTANCE</span><input inputMode="numeric" value={current.distance ?? 0} onChange={(event) => update({ distance: Number(event.target.value || 0) })} /></label>}
+    {current.result === "Returned" && <><PlayerSelect label="RETURNER" roster={receivingRoster} value={current.returnerNumber} onChange={(returnerNumber) => update({ returnerNumber })} /><label><span>RETURN YARDS</span><input inputMode="numeric" value={current.returnYards ?? 0} onChange={(event) => update({ returnYards: Number(event.target.value || 0) })} /></label><button className={current.returnTouchdown ? "selected" : ""} onClick={() => update({ returnTouchdown: !current.returnTouchdown })}>Return touchdown</button></>}
+  </>;
+}
+
 function PrimaryEntry() {
   const {
     plays, rosterRows, awayRosterRows, homeCode, awayCode, scoreboard,
@@ -365,50 +410,159 @@ function PrimaryEntry() {
     scoreboard.away_possession ? "away" : "home"
   );
   const [playType, setPlayType] = useState("Run");
+  const [passResult, setPassResult] = useState<PassResult>("Complete");
+  const [passerNumber, setPasserNumber] = useState("");
+  const [receiverNumber, setReceiverNumber] = useState("");
   const activeRoster = offense === "home" ? rosterRows : awayRosterRows;
   const [player, setPlayer] = useState(activeRoster[0] ?? ["00", "Roster needed", ""]);
-  const [yards, setYards] = useState("6");
-  const [firstDown, setFirstDown] = useState(true);
+  const [recentPlayers, setRecentPlayers] = useState<Record<"home" | "away", string[][]>>({ home: [], away: [] });
+  const [jerseyEntry, setJerseyEntry] = useState("");
+  const [rosterPickerOpen, setRosterPickerOpen] = useState(false);
+  const [rosterFilter, setRosterFilter] = useState("");
+  const [yards, setYards] = useState("0");
+  const [firstDown, setFirstDown] = useState(false);
   const [touchdown, setTouchdown] = useState(false);
-  const [fumble, setFumble] = useState(false);
+  const [turnover, setTurnover] = useState<"" | "FUMBLE LOST" | "INTERCEPTION">("");
   const [outOfBounds, setOutOfBounds] = useState(false);
+  const [specialSubtype, setSpecialSubtype] = useState("Punt");
+  const [specialResult, setSpecialResult] = useState("Returned");
+  const [returnerNumber, setReturnerNumber] = useState("");
+  const [returnYards, setReturnYards] = useState("0");
+  const [tryType, setTryType] = useState("PAT kick");
+  const [penaltyName, setPenaltyName] = useState("");
+  const [penaltyTeam, setPenaltyTeam] = useState<"home" | "away">(offense);
+  const [penaltyAccepted, setPenaltyAccepted] = useState(true);
+  const [penaltyFirstDown, setPenaltyFirstDown] = useState(false);
+  const [penaltyPlayCounts, setPenaltyPlayCounts] = useState(false);
   const [editing, setEditing] = useState<Play | null>(null);
-  const activePlayer = activeRoster.some((row) => row[0] === player[0])
+  const activePlayer = useMemo(() => activeRoster.some((row) => samePlayer(row, player))
     ? player
-    : activeRoster[0] ?? ["00", "Roster needed", ""];
+    : activeRoster[0] ?? ["00", "Roster needed", ""], [activeRoster, player]);
+  const numberMatches = useMemo(() => jerseyMatches(activeRoster, jerseyEntry), [activeRoster, jerseyEntry]);
+  const quickPlayers = useMemo(() => {
+    const sorted = sortRoster(activeRoster);
+    const prioritized = [
+      activePlayer,
+      ...numberMatches,
+      ...recentPlayers[offense],
+      ...sorted.filter((row) => positionMatches(playType, row[2] ?? "")),
+      ...sorted,
+    ];
+    return prioritized.filter((row, index) =>
+      activeRoster.some((candidate) => samePlayer(candidate, row)) &&
+      prioritized.findIndex((candidate) => samePlayer(candidate, row)) === index
+    ).slice(0, 8);
+  }, [activePlayer, activeRoster, numberMatches, offense, playType, recentPlayers]);
+  const filteredRoster = useMemo(() => {
+    const query = rosterFilter.trim().toLowerCase();
+    return sortRoster(activeRoster).filter((row) =>
+      !query || row[0].includes(query) || row[1].toLowerCase().includes(query)
+    );
+  }, [activeRoster, rosterFilter]);
+
+  function changeOffense(nextOffense: "home" | "away") {
+    const nextRoster = nextOffense === "home" ? rosterRows : awayRosterRows;
+    setOffense(nextOffense);
+    setPenaltyTeam(nextOffense);
+    setJerseyEntry("");
+    setRosterFilter("");
+    setRosterPickerOpen(false);
+    setPasserNumber("");
+    setReceiverNumber("");
+    setPlayer((current) => nextRoster.some((row) => samePlayer(row, current))
+      ? current
+      : nextRoster[0] ?? ["00", "Roster needed", ""]);
+  }
+
+  function selectPlayer(nextPlayer: string[]) {
+    setPlayer(nextPlayer);
+    setJerseyEntry("");
+    setRosterPickerOpen(false);
+    setRecentPlayers((current) => ({
+      ...current,
+      [offense]: [nextPlayer, ...current[offense].filter((row) => !samePlayer(row, nextPlayer))].slice(0, 4),
+    }));
+  }
+
+  function enterJerseyDigit(digit: string) {
+    const next = `${jerseyEntry}${digit}`.slice(0, 2);
+    setJerseyEntry(next);
+    const exact = autoSelectedJerseyPlayer(activeRoster, next);
+    if (exact) selectPlayer(exact);
+  }
+
+  function playForEditing(play: Play): Play {
+    if (play.playType !== "Pass") return { ...play };
+    const description = play.description || "";
+    const complete = description.match(/^#([^\s]+)\s+.+?\s+complete to\s+#([^\s]+)\b/i);
+    const passerOnly = description.match(/^#([^\s]+)\b/);
+    const inferredResult: PassResult = /\bintercepted\b/i.test(description)
+      ? "Interception"
+      : /\bsacked\b/i.test(description)
+        ? "Sacked"
+      : /\bincomplete\b/i.test(description)
+        ? "Incomplete"
+        : "Complete";
+    return {
+      ...play,
+      passerNumber: play.passerNumber || complete?.[1] || passerOnly?.[1] || "",
+      receiverNumber: play.receiverNumber || complete?.[2] || "",
+      passResult: play.passResult || inferredResult,
+    };
+  }
 
   async function savePlay() {
     const verb: Record<string, string> = {
       Run: "rush",
-      Pass: "pass complete",
-      Sack: "sacked",
+      Pass: "pass",
       Penalty: "penalty",
       Special: "special teams return",
     };
     const modifiers = [
       touchdown ? "touchdown" : "",
-      fumble ? "fumble" : "",
+      turnover === "FUMBLE LOST" ? "fumble lost" : "",
+      turnover === "INTERCEPTION" ? "intercepted" : "",
       outOfBounds ? "out of bounds" : "",
     ].filter(Boolean);
+    const passer = activeRoster.find((row) => row[0] === passerNumber);
+    const receiver = activeRoster.find((row) => row[0] === receiverNumber);
+    if (playType === "Pass" && !passer) return notify("Choose a passer from the offensive roster");
+    if (playType === "Pass" && passResult === "Complete" && !receiver) return notify("A complete pass requires a receiver");
+    if (playType === "Pass" && passResult === "Sacked" && Number(yards || 0) > 0) return notify("Sack yards must be zero or negative");
+    if (playType === "Pass" && passResult !== "Complete" && passResult !== "Sacked" && Number(yards || 0) !== 0) return notify("Incomplete and intercepted passes must have zero yards");
+    const description = playType === "Pass"
+      ? passResult === "Complete"
+        ? `#${passer?.[0]} ${passer?.[1]} complete to #${receiver?.[0]} ${receiver?.[1]} for ${yards || "0"} yards`
+        : passResult === "Sacked"
+          ? `#${passer?.[0]} ${passer?.[1]} sacked ${Number(yards || 0) < 0 ? `for a loss of ${Math.abs(Number(yards))} yards` : "for no gain"}`
+          : `#${passer?.[0]} ${passer?.[1]} ${passResult === "Incomplete" ? "pass incomplete" : "intercepted"}`
+      : `#${activePlayer[0]} ${activePlayer[1]} ${verb[playType]} for ${yards || "0"} yards${modifiers.length ? ` · ${modifiers.join(" · ")}` : ""}`;
     const next = {
       clock: String(scoreboard.clock || ""),
       situation: [
         scoreboard.down ? `${scoreboard.down}${scoreboard.to_go ? ` & ${scoreboard.to_go}` : ""}` : "",
         scoreboard.ball_on ? `at ${scoreboard.ball_on}` : "",
       ].filter(Boolean).join(" "),
-      description: `#${activePlayer[0]} ${activePlayer[1]} ${verb[playType]} for ${yards || "0"} yards${modifiers.length ? ` · ${modifiers.join(" · ")}` : ""}`,
-      tag: touchdown ? "TOUCHDOWN" : firstDown ? "FIRST DOWN" : fumble ? "FUMBLE" : undefined,
+      description,
+      tag: touchdown ? "TOUCHDOWN" : playType === "Pass" && passResult === "Interception" ? "INTERCEPTION" : turnover || (firstDown ? "FIRST DOWN" : undefined),
       team: offense,
       playType,
-      playerNumber: activePlayer[0],
-      yards: Number(yards || 0),
+      playerNumber: playType === "Pass" ? "" : activePlayer[0],
+      passerNumber: playType === "Pass" ? passerNumber : undefined,
+      receiverNumber: playType === "Pass" && (passResult === "Complete" || passResult === "Incomplete") && receiverNumber ? receiverNumber : undefined,
+      passResult: playType === "Pass" ? passResult : undefined,
+      yards: playType === "Pass" && passResult !== "Complete" && passResult !== "Sacked" ? 0 : Number(yards || 0),
+      details: playType === "Penalty" ? { penalty: { team: penaltyTeam, name: penaltyName, accepted: penaltyAccepted, yards: Number(yards || 0), automaticFirstDown: penaltyFirstDown, playCounts: penaltyPlayCounts } }
+        : playType === "Special" ? { specialTeams: { subtype: specialSubtype, result: specialResult, actorNumber: specialSubtype === "Try" && tryType === "Two-point pass" ? "" : activePlayer[0], returnerNumber, distance: Number(yards || 0), returnYards: Number(returnYards || 0), returnTouchdown: touchdown, tryType, passerNumber, receiverNumber } }
+          : undefined,
     };
-    await createPlay(next);
+    if (!await createPlay(next)) return;
     setYards("0");
     setFirstDown(false);
     setTouchdown(false);
-    setFumble(false);
+    setTurnover("");
     setOutOfBounds(false);
+    setReceiverNumber("");
   }
 
   return (
@@ -421,11 +575,11 @@ function PrimaryEntry() {
             <span className="operator">PRIMARY · AV</span>
           </div>
           <div className="possession-toggle" aria-label="Offensive team">
-            <button className={offense === "home" ? "selected" : ""} onClick={() => setOffense("home")}>{homeCode || "HOME"} offense</button>
-            <button className={offense === "away" ? "selected" : ""} onClick={() => setOffense("away")}>{awayCode || "AWAY"} offense</button>
+            <button className={offense === "home" ? "selected" : ""} onClick={() => changeOffense("home")}>{homeCode || "HOME"} offense</button>
+            <button className={offense === "away" ? "selected" : ""} onClick={() => changeOffense("away")}>{awayCode || "AWAY"} offense</button>
           </div>
           <div className="segmented">
-            {["Run", "Pass", "Sack", "Penalty", "Special"].map((type) => (
+            {["Run", "Pass", "Penalty", "Special"].map((type) => (
               <button
                 key={type}
                 className={playType === type ? "selected" : ""}
@@ -435,47 +589,106 @@ function PrimaryEntry() {
               </button>
             ))}
           </div>
-          <label className="section-label">BALL CARRIER</label>
-          <div className="player-grid">
-            {activeRoster.slice(0, 5).map((item) => (
+          {playType === "Pass" ? (
+            <div className="form-grid pass-entry-fields">
+              <PlayerSelect label="PASSER" roster={activeRoster} value={passerNumber} onChange={setPasserNumber} />
+              <label><span>PASS RESULT</span><select value={passResult} onChange={(event) => {
+                const result = event.target.value as PassResult;
+                setPassResult(result);
+                if (result !== "Complete" && result !== "Sacked") setYards("0");
+              }}><option>Complete</option><option>Incomplete</option><option>Sacked</option><option>Interception</option></select></label>
+              {(passResult === "Complete" || passResult === "Incomplete") && <PlayerSelect label="RECEIVER" roster={activeRoster} value={receiverNumber} onChange={setReceiverNumber} optional={passResult === "Incomplete"} />}
+            </div>
+          ) : <>
+          {playType === "Penalty" && <div className="form-grid">
+            <label><span>PENALTY ON</span><select value={penaltyTeam} onChange={(event) => setPenaltyTeam(event.target.value as "home" | "away")}><option value="home">{homeCode || "Home"}</option><option value="away">{awayCode || "Away"}</option></select></label>
+            <label><span>PENALTY</span><input value={penaltyName} onChange={(event) => setPenaltyName(event.target.value)} placeholder="Holding" /></label>
+            <label><span>STATUS</span><select value={penaltyAccepted ? "Accepted" : "Declined"} onChange={(event) => setPenaltyAccepted(event.target.value === "Accepted")}><option>Accepted</option><option>Declined</option></select></label>
+            <button className={penaltyFirstDown ? "selected" : ""} onClick={() => setPenaltyFirstDown(!penaltyFirstDown)}>Automatic first down</button>
+            <button className={penaltyPlayCounts ? "selected" : ""} onClick={() => setPenaltyPlayCounts(!penaltyPlayCounts)}>Underlying play counts</button>
+          </div>}
+          {playType === "Special" && <div className="form-grid">
+            <label><span>TYPE</span><select value={specialSubtype} onChange={(event) => { const subtype = event.target.value; setSpecialSubtype(subtype); setSpecialResult(subtype === "Try" ? "Made" : subtype === "Field goal" ? "Made" : "Returned"); }}><option>Punt</option><option>Kickoff</option><option>Field goal</option><option>Try</option></select></label>
+            {specialSubtype === "Try" && <label><span>TRY TYPE</span><select value={tryType} onChange={(event) => setTryType(event.target.value)}><option>PAT kick</option><option>Two-point run</option><option>Two-point pass</option></select></label>}
+            <label><span>RESULT</span><select value={specialResult} onChange={(event) => setSpecialResult(event.target.value)}>{(specialSubtype === "Punt" ? ["Returned", "Fair catch", "Touchback", "Downed", "Out of bounds", "Blocked"] : specialSubtype === "Kickoff" ? ["Returned", "Touchback", "Out of bounds", "Onside kicking team", "Onside receiving team"] : ["Made", "Missed", "Blocked", "Failed"].filter((item) => specialSubtype === "Try" ? ["Made", "Failed"].includes(item) : !["Failed"].includes(item))).map((item) => <option key={item}>{item}</option>)}</select></label>
+            {specialResult === "Returned" && <><PlayerSelect label="RETURNER" roster={offense === "home" ? awayRosterRows : rosterRows} value={returnerNumber} onChange={setReturnerNumber} /><label><span>RETURN YARDS</span><input inputMode="numeric" value={returnYards} onChange={(event) => setReturnYards(event.target.value.replace(/[^0-9]/g, ""))} /></label></>}
+            {specialSubtype === "Try" && tryType === "Two-point pass" && <><PlayerSelect label="PASSER" roster={activeRoster} value={passerNumber} onChange={setPasserNumber} /><PlayerSelect label="RECEIVER" roster={activeRoster} value={receiverNumber} onChange={setReceiverNumber} /></>}
+          </div>}
+          {(playType === "Run" || (playType === "Special" && !(specialSubtype === "Try" && tryType === "Two-point pass"))) && <><label className="section-label">{playType === "Run" ? "BALL CARRIER" : specialSubtype === "Punt" ? "PUNTER" : specialSubtype === "Try" && tryType === "Two-point run" ? "RUNNER" : "KICKER"}</label>
+          <div className="player-selection">
+            <section className="jersey-selector" aria-label="Jersey number selector">
+              <div className="jersey-display">
+                <span>JERSEY #</span><strong>{jerseyEntry || "—"}</strong>
+                <small>{jerseyEntry
+                  ? numberMatches.length
+                    ? `${numberMatches.length} match${numberMatches.length === 1 ? "" : "es"}`
+                    : `No player #${jerseyEntry}`
+                  : "Tap number"}</small>
+              </div>
+              <div className="number-pad">
+                {["1", "2", "3", "4", "5", "6", "7", "8", "9", "CLEAR", "0", "⌫"].map((key) => (
+                  <button
+                    type="button"
+                    key={key}
+                    aria-label={key === "⌫" ? "Backspace jersey number" : key === "CLEAR" ? "Clear jersey number" : `Jersey digit ${key}`}
+                    className={key.length > 1 ? "utility" : ""}
+                    onClick={() => {
+                      if (key === "CLEAR") setJerseyEntry("");
+                      else if (key === "⌫") setJerseyEntry((current) => current.slice(0, -1));
+                      else enterJerseyDigit(key);
+                    }}
+                  >{key}</button>
+                ))}
+              </div>
+            </section>
+            <div className="quick-player-area">
+              <div className="quick-player-head"><small>QUICK PLAYERS</small><button type="button" onClick={() => setRosterPickerOpen(true)}>All players <span>→</span></button></div>
+              <div className="player-grid">
+            {quickPlayers.map((item, index) => (
               <button
-                className={activePlayer[0] === item[0] ? "player selected" : "player"}
-                key={item[0]}
-                onClick={() => setPlayer(item)}
+                type="button"
+                className={samePlayer(activePlayer, item) ? "player selected" : jerseyEntry && item[0].startsWith(jerseyEntry) ? "player matching" : "player"}
+                key={`${item[0]}-${item[1]}-${index}`}
+                onClick={() => selectPlayer(item)}
               >
                 <b>#{item[0]}</b><span>{item[1]}</span><small>{item[2]}</small>
               </button>
             ))}
-            <button className="player more"><b>•••</b><span>More</span></button>
-          </div>
+              </div>
+            </div>
+          </div></>}
+          </>}
           <div className="result-row">
             <label>
-              <span>YARDS</span>
+              <span>{playType === "Pass" ? "TOTAL YARDS" : "YARDS"}</span>
               <span className="yard-control">
-                <button onClick={() => setYards(String(Number(yards || 0) - 1))}>−</button>
+                <button disabled={playType === "Pass" && passResult !== "Complete" && passResult !== "Sacked"} onClick={() => setYards(String(Number(yards || 0) - 1))}>−</button>
                 <input
                   inputMode="numeric"
                   value={yards}
                   aria-label="Yards gained"
+                  disabled={playType === "Pass" && passResult !== "Complete" && passResult !== "Sacked"}
                   onChange={(event) => setYards(event.target.value.replace(/[^0-9-]/g, ""))}
                 />
-                <button onClick={() => setYards(String(Number(yards || 0) + 1))}>+</button>
+                <button disabled={playType === "Pass" && passResult !== "Complete" && passResult !== "Sacked"} onClick={() => setYards(String(Number(yards || 0) + 1))}>+</button>
               </span>
             </label>
             <div className="quick-flags">
-              {["First down", "Touchdown", "Fumble", "Out of bounds"].map((flag) => (
+              {["First down", "Touchdown", "Fumble lost", "Out of bounds"].map((flag) => (
                 <button
                   key={flag}
                   className={
                     (flag === "First down" && firstDown) ||
                     (flag === "Touchdown" && touchdown) ||
-                    (flag === "Fumble" && fumble) ||
+                    (flag === "Fumble lost" && turnover === "FUMBLE LOST") ||
+                    (flag === "Interception" && turnover === "INTERCEPTION") ||
                     (flag === "Out of bounds" && outOfBounds) ? "selected" : ""
                   }
                   onClick={() => {
                     if (flag === "First down") setFirstDown(!firstDown);
                     if (flag === "Touchdown") setTouchdown(!touchdown);
-                    if (flag === "Fumble") setFumble(!fumble);
+                    if (flag === "Fumble lost") setTurnover(turnover === "FUMBLE LOST" ? "" : "FUMBLE LOST");
+                    if (flag === "Interception") setTurnover(turnover === "INTERCEPTION" ? "" : "INTERCEPTION");
                     if (flag === "Out of bounds") setOutOfBounds(!outOfBounds);
                   }}
                 >
@@ -487,7 +700,7 @@ function PrimaryEntry() {
           <div className="save-row">
             <button className="secondary-button" onClick={() => {
               setPlayType("Run"); setYards("0"); setFirstDown(false);
-              setTouchdown(false); setFumble(false); setOutOfBounds(false);
+              setTouchdown(false); setTurnover(""); setOutOfBounds(false);
               notify("Play entry cleared");
             }}>Clear</button>
             <div className="next-state">SOURCE <b>{scoreboard.clock ? `Scoreboard · ${scoreboard.clock}` : "Waiting for scoreboard clock"}</b></div>
@@ -496,7 +709,7 @@ function PrimaryEntry() {
         </section>
         <PlayList
           plays={plays}
-          onEdit={setEditing}
+          onEdit={(play) => setEditing(playForEditing(play))}
           onUndo={() => {
             if (!plays.length) return;
             const removed = plays.at(-1);
@@ -504,22 +717,60 @@ function PrimaryEntry() {
           }}
         />
       </div>
+      {rosterPickerOpen && (
+        <div className="modal-backdrop" role="presentation" onClick={() => setRosterPickerOpen(false)}>
+          <section className="modal roster-picker-modal" role="dialog" aria-modal="true" aria-labelledby="roster-picker-title" onClick={(event) => event.stopPropagation()}>
+            <div className="panel-title"><div><span className="eyebrow">{offense === "home" ? homeCode || "HOME" : awayCode || "AWAY"} ROSTER</span><h2 id="roster-picker-title">Choose a player</h2></div><button className="icon-button" aria-label="Close player picker" onClick={() => setRosterPickerOpen(false)}>×</button></div>
+            <label className="roster-search"><span>FILTER BY NUMBER OR NAME</span><input autoFocus value={rosterFilter} onChange={(event) => setRosterFilter(event.target.value)} placeholder="Example: 22 or Martin" /></label>
+            <div className="full-roster-grid">
+              {filteredRoster.map((item, index) => (
+                <button type="button" className={samePlayer(activePlayer, item) ? "roster-player selected" : "roster-player"} key={`${item[0]}-${item[1]}-${index}`} onClick={() => selectPlayer(item)}>
+                  <b>#{item[0]}</b><span>{item[1]}</span><small>{item[2] || "Position not set"}</small>
+                </button>
+              ))}
+            </div>
+            {!filteredRoster.length && <p className="empty-panel-copy">No roster players match “{rosterFilter}”.</p>}
+          </section>
+        </div>
+      )}
       {editing && (
         <div className="modal-backdrop" role="presentation" onClick={() => setEditing(null)}>
           <section className="modal" role="dialog" aria-modal="true" aria-labelledby="edit-play-title" onClick={(event) => event.stopPropagation()}>
             <div className="panel-title"><div><span className="eyebrow">CORRECT PLAY {editing.id}</span><h2 id="edit-play-title">Edit recorded play</h2></div><button className="icon-button" aria-label="Close" onClick={() => setEditing(null)}>×</button></div>
             <label><span>GAME CLOCK</span><input value={editing.clock} onChange={(event) => setEditing({ ...editing, clock: event.target.value })} /></label>
             <label><span>SITUATION</span><input value={editing.situation} onChange={(event) => setEditing({ ...editing, situation: event.target.value })} /></label>
-            <label><span>PLAY DESCRIPTION</span><textarea value={editing.description} onChange={(event) => setEditing({ ...editing, description: event.target.value })} /></label>
+            <p className="empty-panel-copy">Description is regenerated from the statistical fields when saved.</p>
+            <div className="form-grid">
+              <label><span>TEAM</span><select value={editing.team ?? "home"} onChange={(event) => setEditing({ ...editing, team: event.target.value as "home" | "away" })}><option value="home">{homeCode || "Home"}</option><option value="away">{awayCode || "Away"}</option></select></label>
+              <label><span>PLAY TYPE</span><select value={editing.playType ?? "Run"} onChange={(event) => setEditing({ ...editing, playType: event.target.value })}>{["Run", "Pass", "Penalty", "Special"].map((type) => <option key={type}>{type}</option>)}</select></label>
+              {editing.playType === "Pass" ? <>
+                <PlayerSelect label="PASSER" roster={(editing.team ?? "home") === "home" ? rosterRows : awayRosterRows} value={editing.passerNumber} onChange={(passerNumber) => setEditing({ ...editing, passerNumber })} />
+                <label><span>PASS RESULT</span><select value={editing.passResult ?? "Complete"} onChange={(event) => {
+                  const passResult = event.target.value as PassResult;
+                  setEditing({ ...editing, passResult, yards: passResult === "Complete" || passResult === "Sacked" ? editing.yards : 0 });
+                }}><option>Complete</option><option>Incomplete</option><option>Sacked</option><option>Interception</option></select></label>
+                {(["Complete", "Incomplete"] as PassResult[]).includes(editing.passResult ?? "Complete") && <PlayerSelect label="RECEIVER" roster={(editing.team ?? "home") === "home" ? rosterRows : awayRosterRows} value={editing.receiverNumber} onChange={(receiverNumber) => setEditing({ ...editing, receiverNumber })} optional={editing.passResult === "Incomplete"} />}
+              </> : editing.playType === "Run" ? <PlayerSelect label="BALL CARRIER" roster={(editing.team ?? "home") === "home" ? rosterRows : awayRosterRows} value={editing.playerNumber} onChange={(playerNumber) => setEditing({ ...editing, playerNumber })} /> : null}
+              {editing.playType === "Penalty" && <>
+                <label><span>PENALTY ON</span><select value={editing.details?.penalty?.team ?? editing.team ?? "home"} onChange={(event) => setEditing({ ...editing, details: { ...editing.details, penalty: { ...(editing.details?.penalty ?? { name: "", accepted: true, yards: 0, automaticFirstDown: false, playCounts: false }), team: event.target.value as "home" | "away" } } })}><option value="home">{homeCode || "Home"}</option><option value="away">{awayCode || "Away"}</option></select></label>
+                <label><span>PENALTY</span><input value={editing.details?.penalty?.name ?? ""} onChange={(event) => setEditing({ ...editing, details: { ...editing.details, penalty: { ...(editing.details?.penalty ?? { team: editing.team ?? "home", accepted: true, yards: 0, automaticFirstDown: false, playCounts: false }), name: event.target.value } } })} /></label>
+                <label><span>STATUS</span><select value={editing.details?.penalty?.accepted === false ? "Declined" : "Accepted"} onChange={(event) => setEditing({ ...editing, details: { ...editing.details, penalty: { ...(editing.details?.penalty ?? { team: editing.team ?? "home", name: "", yards: 0, automaticFirstDown: false, playCounts: false }), accepted: event.target.value === "Accepted" } } })}><option>Accepted</option><option>Declined</option></select></label>
+                <label><span>PENALTY YARDS</span><input inputMode="numeric" value={editing.details?.penalty?.yards ?? 0} onChange={(event) => setEditing({ ...editing, details: { ...editing.details, penalty: { ...(editing.details?.penalty ?? { team: editing.team ?? "home", name: "", accepted: true, automaticFirstDown: false, playCounts: false }), yards: Number(event.target.value || 0) } } })} /></label>
+                <button className={editing.details?.penalty?.automaticFirstDown ? "selected" : ""} onClick={() => setEditing({ ...editing, details: { ...editing.details, penalty: { ...(editing.details?.penalty ?? { team: editing.team ?? "home", name: "", accepted: true, yards: 0, playCounts: false }), automaticFirstDown: !editing.details?.penalty?.automaticFirstDown } } })}>Automatic first down</button>
+                <button className={editing.details?.penalty?.playCounts ? "selected" : ""} onClick={() => setEditing({ ...editing, details: { ...editing.details, penalty: { ...(editing.details?.penalty ?? { team: editing.team ?? "home", name: "", accepted: true, yards: 0, automaticFirstDown: false }), playCounts: !editing.details?.penalty?.playCounts } } })}>Underlying play counts</button>
+              </>}
+              {editing.playType === "Special" && <SpecialCorrectionFields play={editing} setPlay={setEditing} offenseRoster={(editing.team ?? "home") === "home" ? rosterRows : awayRosterRows} receivingRoster={(editing.team ?? "home") === "home" ? awayRosterRows : rosterRows} />}
+              {(editing.playType === "Run" || editing.playType === "Pass") && <label><span>YARDS</span><input inputMode="numeric" value={editing.yards ?? 0} onChange={(event) => setEditing({ ...editing, yards: Number(event.target.value || 0) })} /></label>}
+              <label><span>RESULT</span><select value={editing.tag ?? ""} onChange={(event) => setEditing({ ...editing, tag: event.target.value || undefined })}><option value="">None</option><option>FIRST DOWN</option><option>TOUCHDOWN</option><option>FUMBLE LOST</option><option>INTERCEPTION</option></select></label>
+            </div>
             <div className="modal-actions">
               <button className="danger-button" onClick={() => {
                 deletePlay(editing.id);
                 setEditing(null);
               }}>Delete play</button>
               <button className="secondary-button" onClick={() => setEditing(null)}>Cancel</button>
-              <button className="primary-button" onClick={() => {
-                updatePlay(editing);
-                setEditing(null);
+              <button className="primary-button" onClick={async () => {
+                if (await updatePlay(editing)) setEditing(null);
               }}>Save correction</button>
             </div>
           </section>
@@ -531,11 +782,36 @@ function PrimaryEntry() {
 
 function DetailEntry() {
   const { plays, rosterRows, awayRosterRows, confirmPlay } = useGame();
-  const [tacklers, setTacklers] = useState(["34"]);
+  const [tacklers, setTacklers] = useState<string[]>([]);
   const [detailFlags, setDetailFlags] = useState<string[]>([]);
+  const [selectedId, setSelectedId] = useState<number | null>(null);
+  const [turnoverPlayer, setTurnoverPlayer] = useState("");
+  const [returnYards, setReturnYards] = useState("0");
+  const [returnTouchdown, setReturnTouchdown] = useState(false);
   const waitingPlays = plays.filter((play) => play.status === "logged");
-  const waiting = waitingPlays.at(-1);
-  const defenders = (waiting?.team === "away" ? rosterRows : awayRosterRows).slice(0, 12);
+  const waiting = waitingPlays.find((play) => play.id === selectedId) ?? waitingPlays[0];
+  const defenders = waiting?.team === "away" ? rosterRows : awayRosterRows;
+  async function finishDetail(noTackle = false) {
+    if (!waiting) return;
+    const selectedTacklers = noTackle ? [] : tacklers;
+    const detail: PlayDetails = {
+      tacklers: selectedTacklers,
+      flags: detailFlags,
+      defensiveCredits: {
+        primary: selectedTacklers[0], assists: selectedTacklers.slice(1),
+        sack: detailFlags.includes("Sack") ? selectedTacklers : [],
+        tackleForLoss: detailFlags.includes("Tackle for loss") ? selectedTacklers : [],
+        forcedFumble: detailFlags.includes("Forced fumble") ? selectedTacklers[0] : undefined,
+        passBreakup: detailFlags.includes("Pass breakup") ? selectedTacklers[0] : undefined,
+      },
+      turnoverDetail: waiting.passResult === "Interception"
+        ? { interceptorNumber: turnoverPlayer || undefined, interceptionReturnYards: Number(returnYards || 0), returnTouchdown }
+        : waiting.tag === "FUMBLE LOST" ? { recovererNumber: turnoverPlayer || undefined } : undefined,
+    };
+    if (await confirmPlay(waiting.id, detail)) {
+      setSelectedId(null); setTacklers([]); setDetailFlags([]); setTurnoverPlayer(""); setReturnYards("0"); setReturnTouchdown(false);
+    }
+  }
   return (
     <main>
       <FieldState />
@@ -572,6 +848,10 @@ function DetailEntry() {
             ))}
           </div>
           {!defenders.length && <p className="empty-panel-copy">Add the opposing roster to assign defensive players.</p>}
+          {(waiting?.passResult === "Interception" || waiting?.tag === "FUMBLE LOST") && <div className="form-grid">
+            <PlayerSelect label={waiting.passResult === "Interception" ? "INTERCEPTOR" : "FUMBLE RECOVERER"} roster={defenders} value={turnoverPlayer} onChange={setTurnoverPlayer} optional />
+            {waiting.passResult === "Interception" && <><label><span>RETURN YARDS</span><input inputMode="numeric" value={returnYards} onChange={(event) => setReturnYards(event.target.value.replace(/[^0-9]/g, ""))} /></label><button className={returnTouchdown ? "selected" : ""} onClick={() => setReturnTouchdown(!returnTouchdown)}>Return touchdown</button></>}
+          </div>}
           <div className="detail-flags">
             {["Tackle for loss", "Sack", "Forced fumble", "Pass breakup"].map((flag) => (
               <button
@@ -583,20 +863,16 @@ function DetailEntry() {
               >{flag}</button>
             ))}
           </div>
-          <button className="primary-button wide" disabled={!waiting} onClick={() => {
-            if (waiting) {
-              confirmPlay(waiting.id, tacklers, detailFlags);
-              setTacklers([]);
-              setDetailFlags([]);
-            }
-          }}>
+          <button className="primary-button wide" disabled={!waiting} onClick={() => finishDetail(false)}>
             {waiting ? "Confirm detail" : "No detail waiting"}
           </button>
+          <button className="secondary-button wide" disabled={!waiting} onClick={() => finishDetail(true)}>No tackle / Confirm play</button>
         </section>
         <aside className="panel queue">
           <span className="eyebrow">DETAIL QUEUE</span>
           <h2>{waitingPlays.length ? `${waitingPlays.length} play${waitingPlays.length === 1 ? "" : "s"} waiting` : "All caught up"}</h2>
           <p>{waitingPlays.length ? `Currently reviewing play ${waiting?.id}.` : "You are ready for the next play."}</p>
+          <div className="plays">{waitingPlays.map((play) => <button className={play.id === waiting?.id ? "play-row selected" : "play-row"} key={play.id} onClick={() => { setSelectedId(play.id); setTacklers([]); setDetailFlags([]); }}><span className="play-number">{play.id}</span><span className="play-copy"><strong>{play.description}</strong></span></button>)}</div>
           <div className="stat-summary"><span>CONFIRMED DETAIL</span><b>{plays.filter((play) => play.status === "confirmed").length} plays reviewed</b><b>{plays.reduce((sum, play) => sum + (play.details?.tacklers?.length ?? 0), 0)} tackles assigned</b></div>
         </aside>
       </div>
@@ -605,51 +881,50 @@ function DetailEntry() {
 }
 
 function PxpPanel() {
-  const { plays, homeName, awayName, homeCode, awayCode, rosterRows, awayRosterRows } = useGame();
+  const { plays, homeName, awayName, homeCode, awayCode, rosterRows, awayRosterRows, scoreboard } = useGame();
   function teamSummary(team: "home" | "away") {
-    const teamPlays = plays.filter((play) => (play.team ?? "home") === team);
-    return {
-      plays: teamPlays.length,
-      firstDowns: teamPlays.filter((play) => play.tag === "FIRST DOWN").length,
-      yards: teamPlays.reduce((sum, play) => sum + Number(play.yards || 0), 0),
-      rushing: teamPlays.filter((play) => play.playType === "Run").reduce((sum, play) => sum + Number(play.yards || 0), 0),
-      passing: teamPlays.filter((play) => play.playType === "Pass").reduce((sum, play) => sum + Number(play.yards || 0), 0),
-      touchdowns: teamPlays.filter((play) => play.tag === "TOUCHDOWN").length,
-      turnovers: teamPlays.filter((play) => play.tag === "FUMBLE" || /intercept/i.test(play.description)).length,
-    };
+    return calculateTeamSummary(plays, team);
   }
   const awayStats = teamSummary("away");
   const homeStats = teamSummary("home");
   const teamStats = [
+    ["Score", String(scoreboard.away_score || 0), String(scoreboard.home_score || 0)],
     ["Plays", awayStats.plays, homeStats.plays],
-    ["First downs", awayStats.firstDowns, homeStats.firstDowns],
+    ["First downs", awayStats.rushingFirstDowns + awayStats.passingFirstDowns + awayStats.penaltyFirstDowns, homeStats.rushingFirstDowns + homeStats.passingFirstDowns + homeStats.penaltyFirstDowns],
+    ["Rush / pass / penalty 1D", `${awayStats.rushingFirstDowns}/${awayStats.passingFirstDowns}/${awayStats.penaltyFirstDowns}`, `${homeStats.rushingFirstDowns}/${homeStats.passingFirstDowns}/${homeStats.penaltyFirstDowns}`],
     ["Total yards", awayStats.yards, homeStats.yards],
     ["Rushing", awayStats.rushing, homeStats.rushing],
     ["Passing", awayStats.passing, homeStats.passing],
     ["Touchdowns", awayStats.touchdowns, homeStats.touchdowns],
     ["Turnovers", awayStats.turnovers, homeStats.turnovers],
+    ["Penalties", `${awayStats.penalties}-${awayStats.penaltyYards}`, `${homeStats.penalties}-${homeStats.penaltyYards}`],
+    ["Punts / avg", `${awayStats.punts}/${awayStats.puntAverage.toFixed(1)}`, `${homeStats.punts}/${homeStats.puntAverage.toFixed(1)}`],
   ];
-  const playersByKey = new Map<string, { number: string; name: string; team: string; plays: number; yards: number; touchdowns: number }>();
-  for (const play of plays) {
-    if (!play.playerNumber) continue;
+  const playersByKey = new Map<string, { number: string; name: string; team: string; plays: number; yards: number; touchdowns: number; passing: number; receiving: number; attempts: number; completions: number; receptions: number; interceptions: number }>();
+  const credit = (play: Play, number: string, values: Partial<{ plays: number; yards: number; touchdowns: number; passing: number; receiving: number; attempts: number; completions: number; receptions: number; interceptions: number }>) => {
     const team = play.team ?? "home";
     const teamRoster = team === "home" ? rosterRows : awayRosterRows;
-    const rosterPlayer = teamRoster.find((row) => row[0] === play.playerNumber);
-    const key = `${team}-${play.playerNumber}`;
-    const current = playersByKey.get(key) ?? {
-      number: play.playerNumber,
-      name: rosterPlayer?.[1] ?? `#${play.playerNumber}`,
-      team: team === "home" ? homeCode || "HOME" : awayCode || "AWAY",
-      plays: 0,
-      yards: 0,
-      touchdowns: 0,
-    };
-    current.plays += 1;
-    current.yards += Number(play.yards || 0);
-    current.touchdowns += play.tag === "TOUCHDOWN" ? 1 : 0;
+    const rosterPlayer = teamRoster.find((row) => row[0] === number);
+    const key = `${team}-${number}`;
+    const current = playersByKey.get(key) ?? { number, name: rosterPlayer?.[1] ?? `#${number}`, team: team === "home" ? homeCode || "HOME" : awayCode || "AWAY", plays: 0, yards: 0, touchdowns: 0, passing: 0, receiving: 0, attempts: 0, completions: 0, receptions: 0, interceptions: 0 };
+    for (const [field, amount] of Object.entries(values)) current[field as keyof typeof values] += amount ?? 0;
     playersByKey.set(key, current);
+  };
+  for (const play of plays) {
+    if (play.playType === "Pass" && play.passerNumber) {
+      credit(play, play.passerNumber, { plays: 1, attempts: play.passResult === "Sacked" ? 0 : 1, completions: play.passResult === "Complete" ? 1 : 0, interceptions: play.passResult === "Interception" ? 1 : 0, passing: play.passResult === "Complete" ? Number(play.yards || 0) : 0, yards: play.passResult === "Complete" ? Number(play.yards || 0) : 0 });
+      if (play.passResult === "Complete" && play.receiverNumber) credit(play, play.receiverNumber, { plays: 1, receptions: 1, receiving: Number(play.yards || 0), yards: Number(play.yards || 0), touchdowns: play.tag === "TOUCHDOWN" ? 1 : 0 });
+    } else if (play.playerNumber) credit(play, play.playerNumber, { plays: 1, yards: Number(play.yards || 0), touchdowns: play.tag === "TOUCHDOWN" ? 1 : 0 });
   }
-  const leaders = [...playersByKey.values()].sort((a, b) => b.yards - a.yards).slice(0, 3);
+  const passingKeys = new Set(plays.filter((play) => play.playType === "Pass" && play.passerNumber).map((play) => `${play.team ?? "home"}-${play.passerNumber}`));
+  const rushingKeys = new Set(plays.filter((play) => play.playType === "Run" && play.playerNumber).map((play) => `${play.team ?? "home"}-${play.playerNumber}`));
+  const passingLeaders = [...playersByKey.entries()].filter(([key]) => passingKeys.has(key)).map(([, player]) => player).sort((a, b) => b.passing - a.passing).slice(0, 2);
+  const rushingLeaders = [...playersByKey.entries()].filter(([key]) => rushingKeys.has(key)).map(([, player]) => player).sort((a, b) => b.yards - a.yards).slice(0, 2);
+  const receivingLeaders = [...playersByKey.values()].filter((player) => player.receptions).sort((a, b) => b.receiving - a.receiving).slice(0, 2);
+  const defensiveLeaders = [...calculatePlayerStats(plays).values()].filter((player) => player.tackles || player.sacks || player.interceptions || player.fumbleRecoveries || player.passBreakups).map((player) => ({ ...player, team: player.team === "home" ? homeCode || "HOME" : awayCode || "AWAY" })).sort((a, b) => b.tackles - a.tackles || b.sacks - a.sacks).slice(0, 2);
+  const leaderGroups: Array<[string, Array<{ number: string; team: string; tackles?: number; sacks?: number; interceptions?: number; fumbleRecoveries?: number; passBreakups?: number; attempts?: number; completions?: number; passing?: number; plays?: number; yards?: number; receptions?: number; receiving?: number }>]> = [
+    ["Passing", passingLeaders], ["Rushing", rushingLeaders], ["Receiving", receivingLeaders], ["Defense", defensiveLeaders],
+  ];
   const latestPlay = plays.at(-1);
   return (
     <main>
@@ -663,12 +938,8 @@ function PxpPanel() {
         </section>
         <section className="panel leaders">
           <div className="panel-title"><div><span className="eyebrow">GAME LEADERS</span><h2>{homeName || awayName ? "Live leaders" : "Game not configured"}</h2></div></div>
-          {leaders.length ? leaders.map((leader, index) => (
-            <div className={index === 0 && leader.yards >= 100 ? "leader standout" : "leader"} key={`${leader.team}-${leader.number}`}>
-              <b>#{leader.number}</b><span><strong>{leader.name}</strong><small>{leader.team}</small></span>
-              <em>{leader.plays} PLAYS · {leader.yards} YDS · {leader.touchdowns} TD</em>
-            </div>
-          )) : <p className="empty-panel-copy">Leaders will appear after plays are recorded.</p>}
+          {leaderGroups.map(([category, categoryLeaders]) => <div key={category}><span className="eyebrow">{category.toUpperCase()}</span>{categoryLeaders.map((leader) => <div className="leader" key={`${leader.team}-${leader.number}`}><b>#{leader.number}</b><span><strong>{leader.team}</strong></span><em>{category === "Passing" ? `${leader.completions}/${leader.attempts} · ${leader.passing} YDS` : category === "Receiving" ? `${leader.receptions} REC · ${leader.receiving} YDS` : category === "Defense" ? [[leader.tackles, "TKL"], [leader.sacks, "SACK"], [leader.interceptions, "INT"], [leader.fumbleRecoveries, "FR"], [leader.passBreakups, "PBU"]].filter(([value]) => value).map(([value, label]) => `${value} ${label}`).join(" · ") : `${leader.plays} ATT · ${leader.yards} YDS`}</em></div>)}</div>)}
+          {!leaderGroups.some(([, items]) => items.length) && <p className="empty-panel-copy">Leaders will appear after plays are recorded.</p>}
         </section>
         <section className="panel comparison">
           <div className="comparison-head"><b>{awayCode}</b><span>TEAM COMPARISON</span><b>{homeCode}</b></div>
@@ -689,12 +960,14 @@ function TvControl() {
   const [selected, setSelected] = useState("Player stat");
   const [onAir, setOnAir] = useState(false);
   const graphics = ["Player stat", "Team comparison", "Current drive", "Scoring summary", "Game leaders", "Last score"];
-  const latestWithPlayer = [...plays].reverse().find((play) => play.playerNumber);
-  const graphicTeam = latestWithPlayer?.team === "away" ? "away" : "home";
+  const latestWithPlayer = [...plays].reverse().find((play) => play.playerNumber || play.passerNumber || play.receiverNumber || play.details?.tacklers?.[0]);
+  const participantNumber = latestWithPlayer?.playerNumber || latestWithPlayer?.passerNumber || latestWithPlayer?.receiverNumber || latestWithPlayer?.details?.tacklers?.[0];
+  const defensiveParticipant = !latestWithPlayer?.playerNumber && !latestWithPlayer?.passerNumber && !latestWithPlayer?.receiverNumber;
+  const graphicTeam = defensiveParticipant ? (latestWithPlayer?.team === "away" ? "home" : "away") : latestWithPlayer?.team === "away" ? "away" : "home";
   const graphicRoster = graphicTeam === "away" ? awayRosterRows : rosterRows;
-  const graphicPlayer = graphicRoster.find((row) => row[0] === latestWithPlayer?.playerNumber);
-  const playerPlays = latestWithPlayer?.playerNumber
-    ? plays.filter((play) => play.playerNumber === latestWithPlayer.playerNumber && (play.team ?? "home") === graphicTeam)
+  const graphicPlayer = graphicRoster.find((row) => row[0] === participantNumber);
+  const playerPlays = participantNumber
+    ? plays.filter((play) => (play.playerNumber === participantNumber || play.passerNumber === participantNumber || play.receiverNumber === participantNumber || play.details?.tacklers?.includes(participantNumber)) && ((defensiveParticipant ? play.team !== graphicTeam : (play.team ?? "home") === graphicTeam)))
     : [];
   const playerYards = playerPlays.reduce((sum, play) => sum + Number(play.yards || 0), 0);
   const playerTouchdowns = playerPlays.filter((play) => play.tag === "TOUCHDOWN").length;
@@ -713,7 +986,7 @@ function TvControl() {
         <div className="graphic-preview">
           <div className="preview-team">{(graphicTeam === "away" ? awayName || awayCode : homeName || homeCode || "GAME NOT CONFIGURED").toUpperCase()}</div>
           <div className="preview-player"><b>{graphicPlayer?.[0] || "–"}</b><span><strong>{graphicPlayer?.[1]?.toUpperCase() || "NO PLAYER DATA"}</strong><small>{graphicPlayer?.[2] || "Record a play to populate this graphic"}</small></span></div>
-          <div className="preview-stats"><span><b>{playerPlays.length}</b>PLAYS</span><span><b>{playerYards}</b>YDS</span><span><b>{playerPlays.length ? (playerYards / playerPlays.length).toFixed(1) : "0.0"}</b>AVG</span><span><b>{playerTouchdowns}</b>TD</span></div>
+          <div className="preview-stats">{defensiveParticipant ? <><span><b>{playerPlays.length}</b>TACKLES</span><span><b>{playerPlays.filter((play) => play.details?.flags?.includes("Sack")).length}</b>SACK</span></> : latestWithPlayer?.passerNumber === participantNumber ? <><span><b>{playerPlays.filter((play) => play.passResult === "Complete").length}/{playerPlays.filter((play) => play.passResult !== "Sacked").length}</b>CMP/ATT</span><span><b>{playerPlays.filter((play) => play.passResult === "Complete").reduce((sum, play) => sum + Number(play.yards || 0), 0)}</b>PASS YDS</span></> : <><span><b>{playerPlays.length}</b>PLAYS</span><span><b>{playerYards}</b>YDS</span><span><b>{playerTouchdowns}</b>TD</span></>}</div>
         </div>
         <div className="control-actions">
           <button className="secondary-button" onClick={() => notify(`${selected} preview refreshed`)}>Update preview</button>
