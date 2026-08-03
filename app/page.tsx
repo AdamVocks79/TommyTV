@@ -18,6 +18,9 @@ type Play = {
   id: number;
   clock: string;
   situation: string;
+  down?: number;
+  distance?: number;
+  ballOn?: string;
   description: string;
   tag?: string;
   status: "logged" | "confirmed";
@@ -92,6 +95,12 @@ function parseRoster(text: string) {
 
 function apiUrl(path: string) {
   return `/api/game${path.replace(/^\/api/, "")}`;
+}
+
+function scoreboardNumber(value: unknown, minimum: number, maximum?: number) {
+  if (value == null || String(value).trim() === "") return undefined;
+  const number = Number(value);
+  return Number.isInteger(number) && number >= minimum && (maximum == null || number <= maximum) ? number : undefined;
 }
 
 async function apiRequest(path: string, options?: RequestInit) {
@@ -543,6 +552,9 @@ function PrimaryEntry() {
         scoreboard.down ? `${scoreboard.down}${scoreboard.to_go ? ` & ${scoreboard.to_go}` : ""}` : "",
         scoreboard.ball_on ? `at ${scoreboard.ball_on}` : "",
       ].filter(Boolean).join(" "),
+      down: scoreboardNumber(scoreboard.down, 1, 4),
+      distance: scoreboardNumber(scoreboard.to_go, 1),
+      ballOn: String(scoreboard.ball_on || "").trim() || undefined,
       description,
       tag: touchdown ? "TOUCHDOWN" : playType === "Pass" && passResult === "Interception" ? "INTERCEPTION" : turnover || (firstDown ? "FIRST DOWN" : undefined),
       team: offense,
@@ -741,6 +753,9 @@ function PrimaryEntry() {
             <label><span>SITUATION</span><input value={editing.situation} onChange={(event) => setEditing({ ...editing, situation: event.target.value })} /></label>
             <p className="empty-panel-copy">Description is regenerated from the statistical fields when saved.</p>
             <div className="form-grid">
+              <label><span>DOWN</span><input inputMode="numeric" value={editing.down ?? ""} placeholder="—" onChange={(event) => setEditing({ ...editing, down: event.target.value === "" ? undefined : Number(event.target.value) })} /></label>
+              <label><span>DISTANCE</span><input inputMode="numeric" value={editing.distance ?? ""} placeholder="—" onChange={(event) => setEditing({ ...editing, distance: event.target.value === "" ? undefined : Number(event.target.value) })} /></label>
+              <label><span>BALL POSITION</span><input value={editing.ballOn ?? ""} placeholder="TAY 35" onChange={(event) => setEditing({ ...editing, ballOn: event.target.value || undefined })} /></label>
               <label><span>TEAM</span><select value={editing.team ?? "home"} onChange={(event) => setEditing({ ...editing, team: event.target.value as "home" | "away" })}><option value="home">{homeCode || "Home"}</option><option value="away">{awayCode || "Away"}</option></select></label>
               <label><span>PLAY TYPE</span><select value={editing.playType ?? "Run"} onChange={(event) => setEditing({ ...editing, playType: event.target.value })}>{["Run", "Pass", "Penalty", "Special"].map((type) => <option key={type}>{type}</option>)}</select></label>
               {editing.playType === "Pass" ? <>
@@ -891,6 +906,8 @@ function PxpPanel() {
     ["Score", String(scoreboard.away_score || 0), String(scoreboard.home_score || 0)],
     ["Plays", awayStats.plays, homeStats.plays],
     ["First downs", awayStats.rushingFirstDowns + awayStats.passingFirstDowns + awayStats.penaltyFirstDowns, homeStats.rushingFirstDowns + homeStats.passingFirstDowns + homeStats.penaltyFirstDowns],
+    ["3rd down", `${awayStats.thirdDownConversions}/${awayStats.thirdDownAttempts}`, `${homeStats.thirdDownConversions}/${homeStats.thirdDownAttempts}`],
+    ["4th down", `${awayStats.fourthDownConversions}/${awayStats.fourthDownAttempts}`, `${homeStats.fourthDownConversions}/${homeStats.fourthDownAttempts}`],
     ["Rush / pass / penalty 1D", `${awayStats.rushingFirstDowns}/${awayStats.passingFirstDowns}/${awayStats.penaltyFirstDowns}`, `${homeStats.rushingFirstDowns}/${homeStats.passingFirstDowns}/${homeStats.penaltyFirstDowns}`],
     ["Total yards", awayStats.yards, homeStats.yards],
     ["Rushing", awayStats.rushing, homeStats.rushing],

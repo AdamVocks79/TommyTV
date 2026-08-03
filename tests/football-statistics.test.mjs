@@ -47,3 +47,36 @@ test("credits incomplete and intercepted passes as attempts but not completions"
   assert.equal(stats.get("away-4").interceptionsThrown, 1);
   assert.equal(stats.get("away-21").rushingYards, 9);
 });
+
+test("tracks third- and fourth-down conversions only for structured offensive snaps", () => {
+  const plays = [
+    { team: "home", playType: "Run", down: 3, distance: 7, yards: 8, tag: "FIRST DOWN" },
+    { team: "home", playType: "Run", down: 3, distance: 7, yards: 4 },
+    { team: "home", playType: "Pass", down: 3, distance: 7, passResult: "Complete", yards: 9, tag: "FIRST DOWN" },
+    { team: "home", playType: "Pass", down: 3, distance: 8, passResult: "Sacked", yards: -7 },
+    { team: "home", playType: "Pass", down: 3, distance: 8, passResult: "Interception", yards: 0 },
+    { team: "home", playType: "Run", down: 3, yards: 1, tag: "TOUCHDOWN" },
+    { team: "home", playType: "Run", down: 4, distance: 2, yards: 3, tag: "FIRST DOWN" },
+    { team: "home", playType: "Pass", down: 4, distance: 5, passResult: "Incomplete", yards: 0 },
+    { team: "home", playType: "Special", down: 4, details: { specialTeams: { subtype: "Punt" } } },
+    { team: "home", playType: "Special", down: 4, details: { specialTeams: { subtype: "Field goal" } } },
+    { team: "home", playType: "Penalty", down: 3, details: { penalty: { accepted: true, automaticFirstDown: true, playCounts: true } } },
+    { team: "home", playType: "Run", yards: 20, tag: "FIRST DOWN" },
+    { team: "home", playType: "Run", down: 3, details: { playCounts: false }, tag: "FIRST DOWN" },
+    { team: "away", playType: "Run", down: 3, distance: 1, yards: 2, tag: "FIRST DOWN" },
+  ];
+  const home = calculateTeamSummary(plays, "home");
+  const away = calculateTeamSummary(plays, "away");
+  assert.deepEqual({ attempts: home.thirdDownAttempts, conversions: home.thirdDownConversions, rate: home.thirdDownRate }, { attempts: 6, conversions: 3, rate: 50 });
+  assert.deepEqual({ attempts: home.fourthDownAttempts, conversions: home.fourthDownConversions, rate: home.fourthDownRate }, { attempts: 2, conversions: 1, rate: 50 });
+  assert.deepEqual({ attempts: away.thirdDownAttempts, conversions: away.thirdDownConversions }, { attempts: 1, conversions: 1 });
+});
+
+test("recalculates conversions after correcting down or result", () => {
+  const play = { team: "home", playType: "Run", down: 2, distance: 3, yards: 3 };
+  assert.equal(calculateTeamSummary([play], "home").thirdDownAttempts, 0);
+  play.down = 3;
+  assert.deepEqual({ attempts: calculateTeamSummary([play], "home").thirdDownAttempts, conversions: calculateTeamSummary([play], "home").thirdDownConversions }, { attempts: 1, conversions: 0 });
+  play.tag = "FIRST DOWN";
+  assert.equal(calculateTeamSummary([play], "home").thirdDownConversions, 1);
+});

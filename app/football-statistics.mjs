@@ -8,6 +8,15 @@ export function calculateTeamSummary(plays, team) {
   const sackLoss = offensive.filter((play) => play.playType === "Pass" && play.passResult === "Sacked").reduce((sum, play) => sum + Math.abs(Number(play.yards || 0)), 0);
   const punts = owned.filter((play) => play.details?.specialTeams?.subtype === "Punt");
   const penalties = plays.filter((play) => play.details?.penalty?.team === team && play.details.penalty.accepted);
+  // Conversion attempts require a structured pre-play down and a real offensive snap;
+  // standalone penalty and special-teams records never count in the current model.
+  const conversions = (down) => {
+    const attempts = offensive.filter((play) => play.down === down && play.details?.playCounts !== false);
+    const made = attempts.filter((play) => play.tag === "FIRST DOWN" || play.tag === "TOUCHDOWN").length;
+    return { attempts: attempts.length, conversions: made, rate: attempts.length ? made / attempts.length * 100 : 0 };
+  };
+  const third = conversions(3);
+  const fourth = conversions(4);
   return {
     plays: offensive.length, ledgerRecords: owned.length,
     rushingFirstDowns: offensive.filter((play) => play.playType === "Run" && play.tag === "FIRST DOWN").length,
@@ -20,6 +29,8 @@ export function calculateTeamSummary(plays, team) {
     penaltyYards: penalties.reduce((sum, play) => sum + Number(play.details.penalty.yards || 0), 0),
     punts: punts.length,
     puntAverage: punts.length ? punts.reduce((sum, play) => sum + Number(play.details.specialTeams.distance || 0), 0) / punts.length : 0,
+    thirdDownAttempts: third.attempts, thirdDownConversions: third.conversions, thirdDownRate: third.rate,
+    fourthDownAttempts: fourth.attempts, fourthDownConversions: fourth.conversions, fourthDownRate: fourth.rate,
   };
 }
 

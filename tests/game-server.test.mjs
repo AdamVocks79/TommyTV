@@ -51,18 +51,12 @@ test("persists game, rosters, MQTT state, plays, and defensive detail", async (t
     created_at TEXT NOT NULL, updated_at TEXT NOT NULL
   )`);
   legacy.close();
-  const child = spawn(process.execPath, ["server/game-server.mjs"], {
+  const startServer = () => spawn(process.execPath, ["server/game-server.mjs"], {
     cwd: new URL("../", import.meta.url),
-    env: {
-      ...process.env,
-      NODE_ENV: "test",
-      GAME_SERVER_HOST: "127.0.0.1",
-      GAME_SERVER_PORT: String(port),
-      GAME_DB_PATH: database,
-      MQTT_URL: "mqtt://127.0.0.1:1",
-    },
+    env: { ...process.env, NODE_ENV: "test", GAME_SERVER_HOST: "127.0.0.1", GAME_SERVER_PORT: String(port), GAME_DB_PATH: database, MQTT_URL: "mqtt://127.0.0.1:1" },
     stdio: "ignore",
   });
+  let child = startServer();
 
   t.after(async () => {
     if (child.exitCode != null) {
@@ -105,6 +99,9 @@ test("persists game, rosters, MQTT state, plays, and defensive detail", async (t
     team: "home",
     clock: "08:42",
     situation: "2 & 6 at TAY 35",
+    down: 2,
+    distance: 6,
+    ballOn: "TAY 35",
     description: "#22 Jalen Price rush for 8 yards",
     tag: "FIRST DOWN",
     playType: "Run",
@@ -125,12 +122,16 @@ test("persists game, rosters, MQTT state, plays, and defensive detail", async (t
   assert.equal(state.scoreboard.payload.clock, "08:42");
   assert.equal(state.plays[0].team, "home");
   assert.equal(state.plays[0].yards, 8);
+  assert.deepEqual({ down: state.plays[0].down, distance: state.plays[0].distance, ballOn: state.plays[0].ballOn }, { down: 2, distance: 6, ballOn: "TAY 35" });
   assert.equal(state.plays[0].status, "confirmed");
   assert.deepEqual(state.plays[0].details.tacklers, ["21"]);
 
   await request("/api/plays/1", "PUT", {
     clock: "08:31",
     situation: "1 & 10 at TAY 43",
+    down: 3,
+    distance: 10,
+    ballOn: "TAY 43",
     description: "regenerated from structured fields",
     tag: "FIRST DOWN",
     team: "away",
@@ -148,6 +149,7 @@ test("persists game, rosters, MQTT state, plays, and defensive detail", async (t
   assert.equal(correctedState.plays[0].receiverNumber, "80");
   assert.equal(correctedState.plays[0].passResult, "Complete");
   assert.equal(correctedState.plays[0].yards, 12);
+  assert.deepEqual({ down: correctedState.plays[0].down, distance: correctedState.plays[0].distance, ballOn: correctedState.plays[0].ballOn }, { down: 3, distance: 10, ballOn: "TAY 43" });
   assert.equal(correctedState.plays[0].description, "#4 Drew Collins complete to #80 Sam Reed for 12 yards");
   assert.deepEqual(correctedState.plays[0].details.tacklers, ["21"]);
 
@@ -228,6 +230,9 @@ test("persists game, rosters, MQTT state, plays, and defensive detail", async (t
   assert.equal(afterInvalidEdit.plays.find((play) => play.id === completed.id).yards, 40);
 
   for (const invalid of [
+    { team: "home", playType: "Run", playerNumber: "22", yards: 1, down: 0 },
+    { team: "home", playType: "Run", playerNumber: "22", yards: 1, down: 5 },
+    { team: "home", playType: "Run", playerNumber: "22", yards: 1, distance: -1 },
     { team: "home", playType: "Penalty", details: { penalty: { name: "Holding", accepted: true, yards: 10 } } },
     { team: "home", playType: "Pass", passerNumber: "5", receiverNumber: "68", passResult: "Incomplete", yards: 2 },
     { team: "home", playType: "Pass", passerNumber: "5", passResult: "Sacked", yards: 1 },
@@ -237,6 +242,14 @@ test("persists game, rosters, MQTT state, plays, and defensive detail", async (t
     { team: "home", playType: "Special", details: { specialTeams: { subtype: "Kickoff", result: "Returned", actorNumber: "5" } } },
     { team: "home", playType: "Special", details: { specialTeams: { subtype: "Field goal", result: "Made", actorNumber: "5", distance: 0 } } },
   ]) await rejected("/api/plays", "POST", invalid);
+
+  const stopped = new Promise((resolve) => child.once("exit", resolve));
+  child.kill("SIGTERM");
+  await stopped;
+  child = startServer();
+  await waitForServer(child);
+  const restartedState = await request("/api/state");
+  assert.deepEqual({ down: restartedState.plays[0].down, distance: restartedState.plays[0].distance, ballOn: restartedState.plays[0].ballOn }, { down: 3, distance: 10, ballOn: "TAY 43" });
 
   await request("/api/plays/1", "DELETE");
   const emptyState = await request("/api/state");

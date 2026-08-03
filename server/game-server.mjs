@@ -59,6 +59,9 @@ if (!playColumns.includes("team")) {
 if (!playColumns.includes("passer_number")) db.exec("ALTER TABLE play ADD COLUMN passer_number TEXT");
 if (!playColumns.includes("receiver_number")) db.exec("ALTER TABLE play ADD COLUMN receiver_number TEXT");
 if (!playColumns.includes("pass_result")) db.exec("ALTER TABLE play ADD COLUMN pass_result TEXT");
+if (!playColumns.includes("down")) db.exec("ALTER TABLE play ADD COLUMN down INTEGER");
+if (!playColumns.includes("distance")) db.exec("ALTER TABLE play ADD COLUMN distance INTEGER");
+if (!playColumns.includes("ball_on")) db.exec("ALTER TABLE play ADD COLUMN ball_on TEXT");
 
 db.prepare(`
   INSERT OR IGNORE INTO game
@@ -83,11 +86,14 @@ function rowsToRoster(team) {
 function readState() {
   const game = db.prepare("SELECT * FROM game WHERE id = 1").get();
   const plays = db.prepare(
-    "SELECT id, clock, situation, description, tag, status, team, play_type, player_number, passer_number, receiver_number, pass_result, yards, details_json FROM play ORDER BY id"
+    "SELECT id, clock, situation, down, distance, ball_on, description, tag, status, team, play_type, player_number, passer_number, receiver_number, pass_result, yards, details_json FROM play ORDER BY id"
   ).all().map((play) => ({
     id: Number(play.id),
     clock: String(play.clock),
     situation: String(play.situation),
+    down: play.down == null ? undefined : Number(play.down),
+    distance: play.distance == null ? undefined : Number(play.distance),
+    ballOn: play.ball_on == null ? undefined : String(play.ball_on),
     description: String(play.description),
     tag: play.tag == null ? undefined : String(play.tag),
     status: String(play.status),
@@ -207,6 +213,15 @@ function cleanPlay(body) {
   let yards = Number(body.yards || 0);
   const incomingDetails = body.details && typeof body.details === "object" && !Array.isArray(body.details) ? body.details : {};
   const details = { ...incomingDetails };
+  const optionalInteger = (value, label, minimum, maximum) => {
+    if (value == null || value === "") return null;
+    const parsed = Number(value);
+    if (!Number.isInteger(parsed) || parsed < minimum || (maximum != null && parsed > maximum)) throw new Error(`${label} is invalid`);
+    return parsed;
+  };
+  const down = optionalInteger(body.down, "Down", 1, 4);
+  const distance = optionalInteger(body.distance, "Distance", 1);
+  const ballOn = String(body.ballOn || "").trim() || null;
   if (!Number.isFinite(yards) || !Number.isInteger(yards)) throw new Error("Yards must be a whole number");
 
   const rosterHas = (number) => Boolean(number) && Boolean(db.prepare(
@@ -308,7 +323,7 @@ function cleanPlay(body) {
     passerNumber: playType === "Pass" ? passerNumber : "",
     receiverNumber: playType === "Pass" && (passResult === "Complete" || passResult === "Incomplete") ? receiverNumber : "",
     passResult: playType === "Pass" ? passResult : "",
-    yards, description, details,
+    yards, description, details, down, distance, ballOn,
   };
 }
 
@@ -370,11 +385,12 @@ const api = createServer(async (request, response) => {
       const now = new Date().toISOString();
       const result = db.prepare(`
         INSERT INTO play
-        (clock, situation, description, tag, status, team, play_type, player_number, passer_number, receiver_number, pass_result, yards, details_json, created_at, updated_at)
-        VALUES (?, ?, ?, ?, 'logged', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        (clock, situation, down, distance, ball_on, description, tag, status, team, play_type, player_number, passer_number, receiver_number, pass_result, yards, details_json, created_at, updated_at)
+        VALUES (?, ?, ?, ?, ?, ?, ?, 'logged', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
       `).run(
         String(body.clock || currentScoreboard().payload.clock || ""),
         String(body.situation || ""),
+        play.down, play.distance, play.ballOn,
         play.description,
         body.tag ? String(body.tag) : null,
         play.team, play.playType, play.playerNumber, play.passerNumber || null,
@@ -396,12 +412,13 @@ const api = createServer(async (request, response) => {
       const mergedDetails = { ...existingDetails, ...play.details };
       const result = db.prepare(`
         UPDATE play
-        SET clock = ?, situation = ?, description = ?, tag = ?, team = ?, play_type = ?,
+        SET clock = ?, situation = ?, down = ?, distance = ?, ball_on = ?, description = ?, tag = ?, team = ?, play_type = ?,
             player_number = ?, passer_number = ?, receiver_number = ?, pass_result = ?, yards = ?, details_json = ?, updated_at = ?
         WHERE id = ?
       `).run(
         String(body.clock || ""),
         String(body.situation || ""),
+        play.down, play.distance, play.ballOn,
         play.description,
         body.tag ? String(body.tag) : null,
         play.team, play.playType, play.playerNumber, play.passerNumber || null,
