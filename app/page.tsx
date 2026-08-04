@@ -369,20 +369,39 @@ function Header({
   );
 }
 
-function FieldState() {
+function FieldState({ live, marked, onAdjustLive, onResumeMqtt, hasManualLive = false }: {
+  live?: PlaySnapshot;
+  marked?: PlaySnapshot | null;
+  onAdjustLive?: () => void;
+  onResumeMqtt?: () => void;
+  hasManualLive?: boolean;
+} = {}) {
   const { scoreboard, homeCode, awayCode, plays } = useGame();
-  const possession = scoreboard.home_possession
+  const state = marked ?? live;
+  const possession = state?.possession === "home"
+    ? homeCode || "HOME"
+    : state?.possession === "away"
+      ? awayCode || "AWAY"
+      : scoreboard.home_possession
     ? homeCode || "HOME"
     : scoreboard.away_possession
       ? awayCode || "AWAY"
       : "UNSET";
+  const source = state?.source ?? (scoreboard._connected ? "mqtt" : "unavailable");
   return (
-    <section className="field-state">
-      <div><small>DOWN</small><strong>{String(scoreboard.down || "–")}</strong></div>
-      <div><small>TO GO</small><strong>{String(scoreboard.to_go || "–")}</strong></div>
-      <div><small>BALL ON</small><strong>{String(scoreboard.ball_on || "–")}</strong></div>
-      <div><small>POSSESSION</small><strong className="possession">{possession}</strong></div>
-      <div className="drive"><small>PLAYS LOGGED</small><strong>{plays.length} this game</strong></div>
+    <section className={`field-state${marked ? " marked" : ""}`}>
+      <div className="field-state-values">
+        <div><small>DOWN</small><strong>{String(state?.down || scoreboard.down || "–")}</strong></div>
+        <div><small>TO GO</small><strong>{String(state?.distance || scoreboard.to_go || "–")}</strong></div>
+        <div><small>BALL ON</small><strong>{String(state?.ballOn || scoreboard.ball_on || "–")}</strong></div>
+        <div><small>POSSESSION</small><strong className="possession">{possession}</strong></div>
+      </div>
+      <div className="field-state-status">
+        {state ? <span className="state-mode">{marked ? <>MARKED PLAY · Q{marked.period || "—"} {marked.clock || "--:--"}</> : "LIVE"}</span> : <span className="state-mode">{plays.length} PLAYS LOGGED</span>}
+        {state && <strong className={`source-badge ${source}`}>{source.toUpperCase()}</strong>}
+        {!marked && onAdjustLive && <button className="field-state-adjust" aria-label="Adjust live game state" onClick={onAdjustLive}>Adjust</button>}
+        {!marked && hasManualLive && onResumeMqtt && <button className="field-state-resume" onClick={onResumeMqtt}>Resume All MQTT</button>}
+      </div>
     </section>
   );
 }
@@ -660,23 +679,26 @@ function PrimaryEntry() {
 
   return (
     <main>
-      <FieldState />
+      <FieldState
+        live={currentLive}
+        marked={snapshot}
+        onAdjustLive={() => openSnapshotEditor("live")}
+        onResumeMqtt={() => setManualLive({})}
+        hasManualLive={Object.keys(manualLive).length > 0}
+      />
       <div className="workspace entry-workspace">
         <section className="panel entry-card">
-          <div className="panel-title">
+          <div className={`panel-title entry-header${snapshot ? " marked-entry-header" : ""}`}>
             <div><span className="eyebrow">NEXT PLAY · {plays.length + 1}</span><h1>What happened?</h1></div>
-            <span className="operator">PRIMARY · AV</span>
+            {snapshot ? <div className="marked-header-tools">
+              <span className="operator">PRIMARY · AV</span>
+              <div className="marked-actions" aria-label="Marked play actions"><button aria-label="Adjust marked play snapshot" onClick={() => openSnapshotEditor("marked")}>Adjust</button><button aria-label="Replace marked snapshot with current live state" onClick={() => { if (hasEntryData && !window.confirm("Replace the marked snapshot with the current live state?")) return; const fresh = liveSnapshot(); setSnapshot(fresh); changeOffense(fresh.possession ?? offense); }}>Use Live State</button><button aria-label="Cancel marked play" onClick={discardMarked}>Cancel</button></div>
+            </div> : <span className="operator">PRIMARY · AV</span>}
           </div>
           {!snapshot ? <div className="mark-idle">
-            <span className="eyebrow">LIVE GAME STATE</span>
-            <div className="snapshot-grid"><b>Q{currentLive.period || "—"}</b><b>{currentLive.clock || "--:--"}</b><span>{currentLive.down || "—"} & {currentLive.distance || "—"}</span><span>{currentLive.ballOn || "Ball position —"}</span><span>{currentLive.possession === "away" ? awayCode || "AWAY" : homeCode || "HOME"} ball</span><span>{awayCode || "AWAY"} {currentLive.awayScore ?? "—"} · {homeCode || "HOME"} {currentLive.homeScore ?? "—"}</span></div>
-            <small className={`source-badge ${currentLive.source}`}>{currentLive.source.toUpperCase()}</small>
-            <button className="secondary-button" onClick={() => openSnapshotEditor("live")}>Adjust Live State</button>
-            {Object.keys(manualLive).length > 0 && <button className="quiet-button" onClick={() => setManualLive({})}>Resume All MQTT</button>}
             <button className="primary-button mark-play-button" onClick={markPlay}>Mark Play</button>
             <p>Tap as soon as the play ends to freeze the game state.</p>
           </div> : <>
-          <section className="marked-snapshot"><div><span className="eyebrow">MARKED PLAY SNAPSHOT</span><small className={`source-badge ${snapshot.source}`}>{snapshot.source.toUpperCase()}</small></div><div className="snapshot-grid"><b>Q{snapshot.period || "—"}</b><b>{snapshot.clock || "--:--"}</b><span>{snapshot.down || "—"} & {snapshot.distance || "—"}</span><span>{snapshot.ballOn || "Ball position —"}</span><span>{snapshot.possession === "away" ? awayCode || "AWAY" : homeCode || "HOME"} ball</span><span>{awayCode || "AWAY"} {snapshot.awayScore ?? "—"} · {homeCode || "HOME"} {snapshot.homeScore ?? "—"}</span></div><div className="snapshot-actions"><button onClick={() => openSnapshotEditor("marked")}>Adjust Snapshot</button><button onClick={() => { if (hasEntryData && !window.confirm("Replace the marked snapshot with the current live state?")) return; const fresh = liveSnapshot(); setSnapshot(fresh); changeOffense(fresh.possession ?? offense); }}>Use Current Live State</button><button onClick={discardMarked}>Cancel Marked Play</button></div></section>
           <div className="possession-toggle" aria-label="Offensive team">
             <button className={offense === "home" ? "selected" : ""} onClick={() => changeOffense("home")}>{homeCode || "HOME"} offense</button>
             <button className={offense === "away" ? "selected" : ""} onClick={() => changeOffense("away")}>{awayCode || "AWAY"} offense</button>
