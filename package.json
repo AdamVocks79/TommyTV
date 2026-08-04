@@ -6,10 +6,13 @@
     "node": ">=22.13.0"
   },
   "scripts": {
-    "dev": "WRANGLER_LOG_PATH=.wrangler/wrangler.log vinext dev --hostname 0.0.0.0",
+    "dev": "next dev -H 0.0.0.0",
     "dev:game": "node --env-file-if-exists=.env.local server/game-server.mjs",
-    "build": "WRANGLER_LOG_PATH=.wrangler/wrangler.log vinext build",
-    "start": "WRANGLER_LOG_PATH=.wrangler/wrangler.log vinext start",
+    "build": "next build",
+    "start": "next start -H 0.0.0.0 -p 3000",
+    "dev:vinext": "cross-env WRANGLER_LOG_PATH=.wrangler/wrangler.log vinext dev --hostname 0.0.0.0",
+    "build:vinext": "cross-env WRANGLER_LOG_PATH=.wrangler/wrangler.log vinext build",
+    "start:vinext": "cross-env WRANGLER_LOG_PATH=.wrangler/wrangler.log vinext start",
     "test": "npm run build && node --test tests/*.test.mjs",
     "lint": "eslint . --ignore-pattern dist --ignore-pattern .next",
     "db:generate": "drizzle-kit generate"
@@ -29,6 +32,7 @@
     "@types/react-dom": "19.2.3",
     "@vitejs/plugin-react": "6.0.2",
     "@vitejs/plugin-rsc": "0.5.26",
+    "cross-env": "^10.1.0",
     "drizzle-kit": "0.31.10",
     "eslint": "9.39.4",
     "eslint-config-next": "16.2.6",

@@ -1195,7 +1195,7 @@ function GameTimeline() {
     <div className="timeline-layout">
       <section className="panel timeline-list">
         <div className="panel-title"><div><span className="eyebrow">FULL GAME</span><h1>{filtered.length} timeline entries</h1></div></div>
-        {filtered.map((play) => {
+        {filtered.map((play: Play) => {
           const special = play.details?.specialTeams;
           const marker = isScoringPlay(play) ? "SCORING" : isTurnoverPlay(play) ? "TURNOVER" : play.playType === "Penalty" ? "PENALTY" : isSpecialTeamsPlay(play) ? "SPECIAL" : isExplosivePlay(play) ? "EXPLOSIVE" : "PLAY";
           const down = play.down ? `${play.down}${play.down === 1 ? "st" : play.down === 2 ? "nd" : play.down === 3 ? "rd" : "th"}${play.distance ? ` & ${play.distance}` : ""}` : "";
@@ -1208,7 +1208,7 @@ function GameTimeline() {
         {!filtered.length && <p className="empty-panel-copy">No plays match these timeline filters.</p>}
       </section>
       <aside className="timeline-sidebar">
-        <section className="panel timeline-card"><span className="eyebrow">SCORING SUMMARY</span>{scoring.map((event) => <p key={event.playId}><b>{event.period ? `Q${event.period}` : "—"} {event.clock}</b> · {teamLabel(event.team)} · {event.type}<small>{event.description}</small></p>)}{!scoring.length && <p>No scoring plays.</p>}</section>
+        <section className="panel timeline-card"><span className="eyebrow">SCORING SUMMARY</span>{scoring.map((event: { playId: number; period?: string; clock: string; team: "home" | "away"; type: string; description: string }) => <p key={event.playId}><b>{event.period ? `Q${event.period}` : "—"} {event.clock}</b> · {teamLabel(event.team)} · {event.type}<small>{event.description}</small></p>)}{!scoring.length && <p>No scoring plays.</p>}</section>
         <section className="panel timeline-card"><span className="eyebrow">LONGEST PLAYS</span><p>{homeCode || "HOME"}: Run {longValue(longest.home.run, "yards")} · Pass {longValue(longest.home.completion, "yards")}</p><p>{awayCode || "AWAY"}: Run {longValue(longest.away.run, "yards")} · Pass {longValue(longest.away.completion, "yards")}</p><p>Punt {longValue(longest.punt, "distance")} · PR {longValue(longest.puntReturn, "returnYards")} · KR {longValue(longest.kickoffReturn, "returnYards")}</p></section>
         <section className="panel timeline-card"><span className="eyebrow">EXPLOSIVE PLAYS</span><p>{homeCode || "HOME"}: {explosive("home", "Run")} run · {explosive("home", "Pass")} pass</p><p>{awayCode || "AWAY"}: {explosive("away", "Run")} run · {explosive("away", "Pass")} pass</p></section>
         <section className="panel timeline-card"><span className="eyebrow">RED ZONE</span><p>{homeCode || "HOME"}: {redZone.home.touchdowns}/{redZone.home.trips} TD · {redZone.home.fieldGoals} FG · {redZone.home.empty} empty</p><p>{awayCode || "AWAY"}: {redZone.away.touchdowns}/{redZone.away.trips} TD · {redZone.away.fieldGoals} FG · {redZone.away.empty} empty</p></section>

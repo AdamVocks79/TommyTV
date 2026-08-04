@@ -86,6 +86,68 @@ npm run lint
 npm run build
 ```
 
+## Windows 11 deployment
+
+### Prerequisites
+
+- Node.js 22.13 or newer (Node.js 24 is supported)
+- Git for Windows
+
+For a fresh installation, open Command Prompt and run:
+
+```cmd
+cd C:\
+git clone https://github.com/AdamVocks79/TommyTV.git
+cd TommyTV
+npm install
+copy .env.example .env.local
+notepad .env.local
+npm run build
+```
+
+The environment file sets the game service bind address and port
+(`GAME_SERVER_HOST` and `GAME_SERVER_PORT`), SQLite file
+(`GAME_DB_PATH`), MQTT broker (`MQTT_URL`), and MQTT topic (`MQTT_TOPIC`).
+The supplied defaults keep the game API on `127.0.0.1:3001`; the frontend
+reaches it through the same-origin `/api/game/...` proxy.
+
+Start the frontend:
+
+```cmd
+cd C:\TommyTV
+npm start
+```
+
+In a second Command Prompt, start the game service:
+
+```cmd
+cd C:\TommyTV
+node --env-file-if-exists=.env.local server\game-server.mjs
+```
+
+The repository-relative `start-frontend.cmd` and `start-game-service.cmd`
+launchers provide the same commands when the repository is installed in a
+different folder.
+
+- Frontend: <http://localhost:3000>
+- Game service: <http://127.0.0.1:3001>
+
+Other studio devices can use the Windows server's IPv4 address, for example
+`http://192.168.18.129:3000`. Allow inbound TCP 3000 in Windows Firewall. TCP
+3001 does not need to be exposed when clients use the frontend proxy; open it
+only if direct game-service access is intentionally required.
+
+To update later:
+
+```cmd
+cd C:\TommyTV
+git pull origin main
+npm install
+npm run build
+```
+
+Restart both processes after the build completes.
+
 ## Known next-phase work
 
 - Verify the real MQTT payload on the production Windows computer
