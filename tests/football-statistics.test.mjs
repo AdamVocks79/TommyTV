@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import test from "node:test";
-import { calculatePlayerStats, calculateTeamSummary } from "../app/football-statistics.mjs";
+import { buildDriveSummaries, buildLongestPlaySummary, buildRedZoneSummary, buildScoringSummary, calculatePlayerStats, calculateTeamSummary, filterTimelinePlays, isExplosivePlay, parseBallPosition } from "../app/football-statistics.mjs";
 
 test("credits one completed pass to passer, receiver, and tackler without rushing yards", () => {
   const stats = calculatePlayerStats([{ team: "home", playType: "Pass", passerNumber: "5", receiverNumber: "68", passResult: "Complete", yards: 40, details: { tacklers: ["66"] } }]);
@@ -79,4 +79,82 @@ test("recalculates conversions after correcting down or result", () => {
   assert.deepEqual({ attempts: calculateTeamSummary([play], "home").thirdDownAttempts, conversions: calculateTeamSummary([play], "home").thirdDownConversions }, { attempts: 1, conversions: 0 });
   play.tag = "FIRST DOWN";
   assert.equal(calculateTeamSummary([play], "home").thirdDownConversions, 1);
+});
+
+test("uses frozen pre-play down and unambiguous field side for commentary statistics", () => {
+  const frozenPlay = { id: 1, team: "home", playType: "Run", period: "2", clock: "06:14", down: 3, distance: 4, ballOn: "LIN 18", yards: 5, tag: "FIRST DOWN" };
+  assert.deepEqual({ attempts: calculateTeamSummary([frozenPlay], "home").thirdDownAttempts, conversions: calculateTeamSummary([frozenPlay], "home").thirdDownConversions }, { attempts: 1, conversions: 1 });
+  assert.equal(filterTimelinePlays([frozenPlay])[0].clock, "06:14");
+  assert.equal(parseBallPosition("LIN 18", "home", { home: "TAY", away: "LIN" }).redZone, true);
+  assert.equal(parseBallPosition("TAY 18", "home", { home: "TAY", away: "LIN" }).redZone, false);
+});
+
+test("filters a chronological timeline by category, quarter, and player search", () => {
+  const plays = [
+    { id: 1, team: "home", period: "1", playType: "Run", playerNumber: "22", yards: 20, description: "#22 Jalen Price rush for 20 yards" },
+    { id: 2, team: "home", period: "1", playType: "Pass", passerNumber: "5", receiverNumber: "68", passResult: "Complete", yards: 25, tag: "TOUCHDOWN", description: "#5 pass to #68 for touchdown" },
+    { id: 3, team: "away", period: "2", playType: "Pass", passResult: "Interception", details: { turnoverDetail: { interceptionReturnYards: 20 } }, description: "intercepted" },
+    { id: 4, team: "away", playType: "Penalty", description: "Holding" },
+    { id: 5, team: "away", period: "2", playType: "Special", details: { specialTeams: { subtype: "Punt", result: "Returned", distance: 48, returnYards: 21 } }, description: "punt returned" },
+  ];
+  assert.deepEqual(filterTimelinePlays(plays).map((play) => play.id), [1, 2, 3, 4, 5]);
+  assert.deepEqual(filterTimelinePlays(plays, { category: "Scoring" }).map((play) => play.id), [2]);
+  assert.deepEqual(filterTimelinePlays(plays, { category: "Turnovers" }).map((play) => play.id), [3]);
+  assert.deepEqual(filterTimelinePlays(plays, { category: "Penalties" }).map((play) => play.id), [4]);
+  assert.deepEqual(filterTimelinePlays(plays, { category: "Special Teams" }).map((play) => play.id), [5]);
+  assert.deepEqual(filterTimelinePlays(plays, { period: "Q1" }).map((play) => play.id), [1, 2]);
+  assert.equal(filterTimelinePlays(plays, { period: "All" }).some((play) => play.id === 4), true);
+  assert.deepEqual(filterTimelinePlays(plays, { query: "Jalen", rosters: { home: [["22", "Jalen Price", "RB"]] } }).map((play) => play.id), [1]);
+  assert.deepEqual(filterTimelinePlays(plays, { query: "#68" }).map((play) => play.id), [2]);
+  assert.equal(isExplosivePlay(plays[0]), true);
+  assert.equal(isExplosivePlay(plays[1]), true);
+  assert.equal(isExplosivePlay({ playType: "Run", yards: 19 }), false);
+  assert.equal(isExplosivePlay({ playType: "Pass", passResult: "Complete", yards: 24 }), false);
+  assert.equal(buildScoringSummary(plays).length, 1);
+});
+
+test("builds longest-play and separate team commentary summaries", () => {
+  const plays = [
+    { id: 1, team: "home", playType: "Run", yards: 12 }, { id: 2, team: "home", playType: "Run", yards: 24 },
+    { id: 3, team: "away", playType: "Pass", passResult: "Complete", yards: 31 },
+    { id: 4, team: "home", playType: "Special", details: { specialTeams: { subtype: "Punt", result: "Returned", distance: 52, returnYards: 22 } } },
+    { id: 5, team: "away", playType: "Special", details: { specialTeams: { subtype: "Kickoff", result: "Returned", returnYards: 35 } } },
+  ];
+  const longest = buildLongestPlaySummary(plays);
+  assert.equal(longest.home.run.id, 2);
+  assert.equal(longest.away.completion.id, 3);
+  assert.equal(longest.punt.id, 4);
+  assert.equal(longest.puntReturn.id, 4);
+  assert.equal(longest.kickoffReturn.id, 5);
+  assert.equal(calculateTeamSummary(plays, "home").plays, 2);
+  assert.equal(calculateTeamSummary(plays, "away").plays, 1);
+});
+
+test("infers common drive endings and excludes non-offensive yards", () => {
+  const drives = buildDriveSummaries([
+    { id: 1, team: "home", period: "1", clock: "10:00", playType: "Run", yards: 8 },
+    { id: 2, team: "home", period: "1", clock: "09:20", playType: "Penalty", yards: 0 },
+    { id: 3, team: "home", period: "1", clock: "08:50", playType: "Pass", passResult: "Complete", yards: 22, tag: "TOUCHDOWN" },
+    { id: 4, team: "away", playType: "Run", yards: 3 },
+    { id: 5, team: "away", playType: "Special", details: { specialTeams: { subtype: "Punt", distance: 40 } } },
+    { id: 6, team: "home", playType: "Pass", passResult: "Interception", yards: 0 },
+    { id: 7, team: "away", playType: "Run", yards: 4, tag: "FUMBLE LOST" },
+    { id: 8, team: "home", playType: "Run", yards: 5 },
+  ]);
+  assert.deepEqual(drives.map((drive) => drive.result), ["Touchdown", "Punt", "Interception", "Fumble", "In Progress"]);
+  assert.deepEqual({ plays: drives[0].plays, yards: drives[0].yards }, { plays: 2, yards: 30 });
+});
+
+test("summarizes recognized red-zone trips and safely excludes unknown ball positions", () => {
+  const codes = { home: "TAY", away: "LIN" };
+  const summary = buildRedZoneSummary([
+    { id: 1, team: "home", playType: "Run", ballOn: "LIN 20", yards: 4 },
+    { id: 2, team: "home", playType: "Run", ballOn: "LIN 16", yards: 16, tag: "TOUCHDOWN" },
+    { id: 3, team: "away", playType: "Run", ballOn: "TAY 18", yards: 2 },
+    { id: 4, team: "away", playType: "Special", details: { specialTeams: { subtype: "Field goal", result: "Made" } } },
+    { id: 5, team: "home", playType: "Run", ballOn: "LIN 12", yards: 1 },
+    { id: 6, team: "away", playType: "Run", ballOn: "UNKNOWN", yards: 2 },
+  ], codes);
+  assert.deepEqual({ trips: summary.home.trips, touchdowns: summary.home.touchdowns, empty: summary.home.empty }, { trips: 2, touchdowns: 1, empty: 1 });
+  assert.deepEqual({ trips: summary.away.trips, fieldGoals: summary.away.fieldGoals }, { trips: 1, fieldGoals: 1 });
 });

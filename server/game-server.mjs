@@ -62,6 +62,7 @@ if (!playColumns.includes("pass_result")) db.exec("ALTER TABLE play ADD COLUMN p
 if (!playColumns.includes("down")) db.exec("ALTER TABLE play ADD COLUMN down INTEGER");
 if (!playColumns.includes("distance")) db.exec("ALTER TABLE play ADD COLUMN distance INTEGER");
 if (!playColumns.includes("ball_on")) db.exec("ALTER TABLE play ADD COLUMN ball_on TEXT");
+if (!playColumns.includes("period")) db.exec("ALTER TABLE play ADD COLUMN period TEXT");
 
 db.prepare(`
   INSERT OR IGNORE INTO game
@@ -86,7 +87,7 @@ function rowsToRoster(team) {
 function readState() {
   const game = db.prepare("SELECT * FROM game WHERE id = 1").get();
   const plays = db.prepare(
-    "SELECT id, clock, situation, down, distance, ball_on, description, tag, status, team, play_type, player_number, passer_number, receiver_number, pass_result, yards, details_json FROM play ORDER BY id"
+    "SELECT id, clock, situation, down, distance, ball_on, period, description, tag, status, team, play_type, player_number, passer_number, receiver_number, pass_result, yards, details_json, created_at, updated_at FROM play ORDER BY id"
   ).all().map((play) => ({
     id: Number(play.id),
     clock: String(play.clock),
@@ -94,6 +95,7 @@ function readState() {
     down: play.down == null ? undefined : Number(play.down),
     distance: play.distance == null ? undefined : Number(play.distance),
     ballOn: play.ball_on == null ? undefined : String(play.ball_on),
+    period: play.period == null ? undefined : String(play.period),
     description: String(play.description),
     tag: play.tag == null ? undefined : String(play.tag),
     status: String(play.status),
@@ -105,6 +107,8 @@ function readState() {
     passResult: play.pass_result == null ? undefined : String(play.pass_result),
     yards: Number(play.yards),
     details: JSON.parse(String(play.details_json || "{}")),
+    createdAt: String(play.created_at),
+    updatedAt: String(play.updated_at),
   }));
 
   return {
@@ -144,6 +148,12 @@ function json(response, status, value) {
     "Cache-Control": "no-store",
   });
   response.end(JSON.stringify(value));
+}
+
+function exportFilename(state) {
+  const date = new Date().toISOString().slice(0, 10);
+  const clean = (value, fallback) => String(value || fallback).normalize("NFKD").replace(/[^a-zA-Z0-9_-]+/g, "_").replace(/^_+|_+$/g, "").slice(0, 48) || fallback;
+  return `${date}_${clean(state.game.homeName, "Home")}_vs_${clean(state.game.awayName, "Away")}.json`;
 }
 
 async function readJson(request) {
@@ -222,6 +232,7 @@ function cleanPlay(body) {
   const down = optionalInteger(body.down, "Down", 1, 4);
   const distance = optionalInteger(body.distance, "Distance", 1);
   const ballOn = String(body.ballOn || "").trim() || null;
+  const period = String(body.period || "").trim() || null;
   if (!Number.isFinite(yards) || !Number.isInteger(yards)) throw new Error("Yards must be a whole number");
 
   const rosterHas = (number) => Boolean(number) && Boolean(db.prepare(
@@ -323,7 +334,7 @@ function cleanPlay(body) {
     passerNumber: playType === "Pass" ? passerNumber : "",
     receiverNumber: playType === "Pass" && (passResult === "Complete" || passResult === "Incomplete") ? receiverNumber : "",
     passResult: playType === "Pass" ? passResult : "",
-    yards, description, details, down, distance, ballOn,
+    yards, description, details, down, distance, ballOn, period,
   };
 }
 
@@ -341,6 +352,30 @@ const api = createServer(async (request, response) => {
     }
     if (request.method === "GET" && url.pathname === "/api/state") {
       json(response, 200, readState());
+      return;
+    }
+    if (request.method === "GET" && url.pathname === "/api/export") {
+      const state = readState();
+      const snapshot = {
+        formatVersion: 1,
+        exportedAt: new Date().toISOString(),
+        game: state.game,
+        rosters: state.rosters,
+        plays: state.plays.map((play) => ({
+          ...play,
+          down: play.down ?? null, distance: play.distance ?? null, ballOn: play.ballOn ?? null,
+          period: play.period ?? null,
+          passerNumber: play.passerNumber ?? null, receiverNumber: play.receiverNumber ?? null, passResult: play.passResult ?? null,
+          details: play.details ?? {},
+        })),
+        scoreboard: state.scoreboard,
+      };
+      response.writeHead(200, {
+        "Content-Type": "application/json; charset=utf-8",
+        "Content-Disposition": `attachment; filename="${exportFilename(state)}"`,
+        "Cache-Control": "no-store",
+      });
+      response.end(JSON.stringify(snapshot, null, 2));
       return;
     }
     if (request.method === "GET" && url.pathname === "/api/events") {
@@ -371,6 +406,28 @@ const api = createServer(async (request, response) => {
       json(response, 200, readState());
       return;
     }
+    if (request.method === "POST" && url.pathname === "/api/game/reset") {
+      const body = await readJson(request);
+      if (body.confirmation !== "NEW GAME") throw new Error("Type NEW GAME to confirm");
+      const keepTeamsAndRosters = body.keepTeamsAndRosters === true;
+      db.exec("BEGIN");
+      try {
+        db.prepare("DELETE FROM play").run();
+        if (!keepTeamsAndRosters) {
+          db.prepare("DELETE FROM roster").run();
+          db.prepare("UPDATE game SET home_name = '', away_name = '', home_code = '', away_code = '', updated_at = ? WHERE id = 1").run(new Date().toISOString());
+        }
+        db.exec("COMMIT");
+      } catch (error) {
+        db.exec("ROLLBACK");
+        throw error;
+      }
+      // Preserve the MQTT client connection, but discard payload retained from the previous game.
+      scoreboard = { connected: scoreboard.connected, stale: true, received_at_utc: null, payload: {} };
+      broadcast();
+      json(response, 200, readState());
+      return;
+    }
     const rosterMatch = url.pathname.match(/^\/api\/rosters\/(home|away)$/);
     if (request.method === "PUT" && rosterMatch) {
       const body = await readJson(request);
@@ -385,12 +442,12 @@ const api = createServer(async (request, response) => {
       const now = new Date().toISOString();
       const result = db.prepare(`
         INSERT INTO play
-        (clock, situation, down, distance, ball_on, description, tag, status, team, play_type, player_number, passer_number, receiver_number, pass_result, yards, details_json, created_at, updated_at)
-        VALUES (?, ?, ?, ?, ?, ?, ?, 'logged', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        (clock, situation, down, distance, ball_on, period, description, tag, status, team, play_type, player_number, passer_number, receiver_number, pass_result, yards, details_json, created_at, updated_at)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'logged', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
       `).run(
         String(body.clock || currentScoreboard().payload.clock || ""),
         String(body.situation || ""),
-        play.down, play.distance, play.ballOn,
+        play.down, play.distance, play.ballOn, play.period,
         play.description,
         body.tag ? String(body.tag) : null,
         play.team, play.playType, play.playerNumber, play.passerNumber || null,
@@ -412,13 +469,13 @@ const api = createServer(async (request, response) => {
       const mergedDetails = { ...existingDetails, ...play.details };
       const result = db.prepare(`
         UPDATE play
-        SET clock = ?, situation = ?, down = ?, distance = ?, ball_on = ?, description = ?, tag = ?, team = ?, play_type = ?,
+        SET clock = ?, situation = ?, down = ?, distance = ?, ball_on = ?, period = ?, description = ?, tag = ?, team = ?, play_type = ?,
             player_number = ?, passer_number = ?, receiver_number = ?, pass_result = ?, yards = ?, details_json = ?, updated_at = ?
         WHERE id = ?
       `).run(
         String(body.clock || ""),
         String(body.situation || ""),
-        play.down, play.distance, play.ballOn,
+        play.down, play.distance, play.ballOn, play.period,
         play.description,
         body.tag ? String(body.tag) : null,
         play.team, play.playType, play.playerNumber, play.passerNumber || null,

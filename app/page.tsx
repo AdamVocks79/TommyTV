@@ -1,12 +1,13 @@
 "use client";
 
-import { createContext, useCallback, useContext, useEffect, useMemo, useState } from "react";
+import { createContext, useCallback, useContext, useEffect, useMemo, useRef, useState } from "react";
 import { usePathname } from "next/navigation";
 import { autoSelectedJerseyPlayer, jerseyMatches, positionMatches, samePlayer, sortRoster } from "./player-selection";
-import { calculatePlayerStats, calculateTeamSummary } from "./football-statistics.mjs";
+import { buildDriveSummaries, buildLongestPlaySummary, buildRedZoneSummary, buildScoringSummary, calculatePlayerStats, calculateTeamSummary, filterTimelinePlays, isExplosivePlay, isScoringPlay, isSpecialTeamsPlay, isTurnoverPlay } from "./football-statistics.mjs";
 
-type Role = "entry-primary" | "entry-detail" | "pxp" | "control" | "admin";
+type Role = "entry-primary" | "entry-detail" | "pxp" | "timeline" | "control" | "admin";
 type PassResult = "Complete" | "Incomplete" | "Sacked" | "Interception";
+type PlaySnapshot = { period?: string; clock?: string; down?: number; distance?: number; ballOn?: string; possession?: "home" | "away"; homeScore?: number; awayScore?: number; capturedAt: string; source: "mqtt" | "manual" | "mixed" | "unavailable" };
 type PlayDetails = {
   tacklers?: string[]; flags?: string[];
   defensiveCredits?: { primary?: string; assists?: string[]; sack?: string[]; tackleForLoss?: string[]; forcedFumble?: string; passBreakup?: string };
@@ -21,6 +22,7 @@ type Play = {
   down?: number;
   distance?: number;
   ballOn?: string;
+  period?: string;
   description: string;
   tag?: string;
   status: "logged" | "confirmed";
@@ -38,6 +40,7 @@ const roles: { id: Role; label: string; short: string }[] = [
   { id: "entry-primary", label: "Primary Stats", short: "ENTRY" },
   { id: "entry-detail", label: "Defensive Detail", short: "DETAIL" },
   { id: "pxp", label: "PxP Panel", short: "PXP" },
+  { id: "timeline", label: "Game Timeline", short: "TIMELINE" },
   { id: "control", label: "TommyTV Control", short: "TV" },
   { id: "admin", label: "Game Setup", short: "SETUP" },
 ];
@@ -65,6 +68,8 @@ type GameContextValue = {
   updatePlay: (play: Play) => Promise<boolean>;
   deletePlay: (id: number) => Promise<void>;
   confirmPlay: (id: number, detail: PlayDetails) => Promise<boolean>;
+  exportCurrentGame: () => Promise<boolean>;
+  resetGame: (keepTeamsAndRosters: boolean, confirmation: string) => Promise<boolean>;
   toast: string;
   notify: (message: string) => void;
 };
@@ -246,13 +251,44 @@ function GameProvider({ children }: { children: React.ReactNode }) {
     }
   }
 
+  async function exportCurrentGame() {
+    try {
+      const response = await fetch(apiUrl("/api/export"));
+      if (!response.ok) throw new Error("Could not export game");
+      const blob = await response.blob();
+      const disposition = response.headers.get("Content-Disposition") || "";
+      const filename = disposition.match(/filename="([^"]+)"/)?.[1] || "tommytv-game.json";
+      const url = URL.createObjectURL(blob);
+      const link = document.createElement("a");
+      link.href = url; link.download = filename; link.click();
+      URL.revokeObjectURL(url);
+      notify("Current game exported");
+      return true;
+    } catch (error) {
+      notify(error instanceof Error ? error.message : "Could not export game");
+      return false;
+    }
+  }
+
+  async function resetGame(keepTeamsAndRosters: boolean, confirmation: string) {
+    try {
+      const state = await apiRequest("/api/game/reset", { method: "POST", body: JSON.stringify({ keepTeamsAndRosters, confirmation }) });
+      applyState(state);
+      notify("New game ready");
+      return true;
+    } catch (error) {
+      notify(error instanceof Error ? error.message : "Could not start new game");
+      return false;
+    }
+  }
+
   return (
     <GameContext.Provider value={{
       plays, setPlays, homeName, setHomeName, awayName, setAwayName,
       homeCode, setHomeCode, awayCode, setAwayCode, rosterRows, setRosterRows,
       awayRosterRows, setAwayRosterRows,
       scoreboard, backendOnline, saveGame, saveRoster, createPlay, updatePlay,
-      deletePlay, confirmPlay,
+      deletePlay, confirmPlay, exportCurrentGame, resetGame,
       toast, notify,
     }}>
       {children}
@@ -318,6 +354,8 @@ function Header({
             className={role === item.id ? "active" : ""}
             onClick={(event) => {
               event.preventDefault();
+              if (item.id !== role && sessionStorage.getItem("tommytv-pending-play") && !window.confirm("Discard this marked play and leave Primary Stats?")) return;
+              if (item.id !== role) sessionStorage.removeItem("tommytv-pending-play");
               window.history.pushState({}, "", `/${item.id}`);
               setRole(item.id);
             }}
@@ -418,7 +456,11 @@ function PrimaryEntry() {
   const [offense, setOffense] = useState<"home" | "away">(
     scoreboard.away_possession ? "away" : "home"
   );
-  const [playType, setPlayType] = useState("Run");
+  const [playType, setPlayType] = useState("");
+  const [snapshot, setSnapshot] = useState<PlaySnapshot | null>(null);
+  const [snapshotModal, setSnapshotModal] = useState<"live" | "marked" | null>(null);
+  const [snapshotDraft, setSnapshotDraft] = useState<PlaySnapshot | null>(null);
+  const [manualLive, setManualLive] = useState<Partial<PlaySnapshot>>({});
   const [passResult, setPassResult] = useState<PassResult>("Complete");
   const [passerNumber, setPasserNumber] = useState("");
   const [receiverNumber, setReceiverNumber] = useState("");
@@ -444,6 +486,48 @@ function PrimaryEntry() {
   const [penaltyFirstDown, setPenaltyFirstDown] = useState(false);
   const [penaltyPlayCounts, setPenaltyPlayCounts] = useState(false);
   const [editing, setEditing] = useState<Play | null>(null);
+  const previousPlayCount = useRef(plays.length);
+  const hasEntryData = Boolean(playType || passerNumber || receiverNumber || jerseyEntry || penaltyName || Number(yards) || firstDown || touchdown || turnover || outOfBounds);
+  const liveSnapshot = useCallback((): PlaySnapshot => {
+    const manual = Object.keys(manualLive).some((key) => !["capturedAt", "source"].includes(key));
+    const mqtt = Boolean(scoreboard._connected);
+    const value = <T,>(field: keyof PlaySnapshot, fallback: T) => manualLive[field] !== undefined ? manualLive[field] as T : fallback;
+    const possession = scoreboard.away_possession ? "away" : scoreboard.home_possession ? "home" : offense;
+    return {
+      period: value("period", String(scoreboard.period || "").trim() || undefined),
+      clock: value("clock", String(scoreboard.clock || "").trim() || undefined),
+      down: value("down", scoreboardNumber(scoreboard.down, 1, 4)),
+      distance: value("distance", scoreboardNumber(scoreboard.to_go, 1)),
+      ballOn: value("ballOn", String(scoreboard.ball_on || "").trim() || undefined),
+      possession: value("possession", possession),
+      homeScore: value("homeScore", scoreboardNumber(scoreboard.home_score, 0)),
+      awayScore: value("awayScore", scoreboardNumber(scoreboard.away_score, 0)),
+      capturedAt: new Date().toISOString(), source: manual && mqtt ? "mixed" : manual ? "manual" : mqtt ? "mqtt" : "unavailable",
+    };
+  }, [manualLive, offense, scoreboard]);
+
+  function clearEntry() {
+    setPlayType(""); setYards("0"); setFirstDown(false); setTouchdown(false); setTurnover(""); setOutOfBounds(false);
+    setPasserNumber(""); setReceiverNumber(""); setPenaltyName(""); setReturnerNumber(""); setReturnYards("0"); setJerseyEntry("");
+  }
+  function markPlay() {
+    const frozen = liveSnapshot();
+    setSnapshot(frozen); changeOffense(frozen.possession ?? offense); sessionStorage.setItem("tommytv-pending-play", "1");
+  }
+  function discardMarked() {
+    if (hasEntryData && !window.confirm("Discard this marked play and all unsaved entry data?")) return;
+    clearEntry(); setSnapshot(null); sessionStorage.removeItem("tommytv-pending-play");
+  }
+
+  useEffect(() => {
+    const warn = (event: BeforeUnloadEvent) => { if (!snapshot) return; event.preventDefault(); event.returnValue = ""; };
+    window.addEventListener("beforeunload", warn);
+    return () => window.removeEventListener("beforeunload", warn);
+  }, [snapshot]);
+  useEffect(() => {
+    if (snapshot && previousPlayCount.current > 0 && plays.length === 0) { clearEntry(); setSnapshot(null); sessionStorage.removeItem("tommytv-pending-play"); }
+    previousPlayCount.current = plays.length;
+  }, [plays.length, snapshot]);
   const activePlayer = useMemo(() => activeRoster.some((row) => samePlayer(row, player))
     ? player
     : activeRoster[0] ?? ["00", "Roster needed", ""], [activeRoster, player]);
@@ -521,6 +605,7 @@ function PrimaryEntry() {
   }
 
   async function savePlay() {
+    if (!snapshot) return notify("Mark the play first");
     const verb: Record<string, string> = {
       Run: "rush",
       Pass: "pass",
@@ -547,14 +632,13 @@ function PrimaryEntry() {
           : `#${passer?.[0]} ${passer?.[1]} ${passResult === "Incomplete" ? "pass incomplete" : "intercepted"}`
       : `#${activePlayer[0]} ${activePlayer[1]} ${verb[playType]} for ${yards || "0"} yards${modifiers.length ? ` · ${modifiers.join(" · ")}` : ""}`;
     const next = {
-      clock: String(scoreboard.clock || ""),
+      // The frozen snapshot supplies the pre-play situation and mark-time clock.
+      clock: snapshot.clock || "",
       situation: [
-        scoreboard.down ? `${scoreboard.down}${scoreboard.to_go ? ` & ${scoreboard.to_go}` : ""}` : "",
-        scoreboard.ball_on ? `at ${scoreboard.ball_on}` : "",
+        snapshot.down ? `${snapshot.down}${snapshot.distance ? ` & ${snapshot.distance}` : ""}` : "",
+        snapshot.ballOn ? `at ${snapshot.ballOn}` : "",
       ].filter(Boolean).join(" "),
-      down: scoreboardNumber(scoreboard.down, 1, 4),
-      distance: scoreboardNumber(scoreboard.to_go, 1),
-      ballOn: String(scoreboard.ball_on || "").trim() || undefined,
+      down: snapshot.down, distance: snapshot.distance, ballOn: snapshot.ballOn, period: snapshot.period,
       description,
       tag: touchdown ? "TOUCHDOWN" : playType === "Pass" && passResult === "Interception" ? "INTERCEPTION" : turnover || (firstDown ? "FIRST DOWN" : undefined),
       team: offense,
@@ -569,13 +653,10 @@ function PrimaryEntry() {
           : undefined,
     };
     if (!await createPlay(next)) return;
-    setYards("0");
-    setFirstDown(false);
-    setTouchdown(false);
-    setTurnover("");
-    setOutOfBounds(false);
-    setReceiverNumber("");
+    clearEntry(); setSnapshot(null); sessionStorage.removeItem("tommytv-pending-play");
   }
+  const currentLive = liveSnapshot();
+  const openSnapshotEditor = (mode: "live" | "marked") => { const value = mode === "marked" ? snapshot : currentLive; setSnapshotDraft(value ? { ...value } : null); setSnapshotModal(mode); };
 
   return (
     <main>
@@ -586,6 +667,16 @@ function PrimaryEntry() {
             <div><span className="eyebrow">NEXT PLAY · {plays.length + 1}</span><h1>What happened?</h1></div>
             <span className="operator">PRIMARY · AV</span>
           </div>
+          {!snapshot ? <div className="mark-idle">
+            <span className="eyebrow">LIVE GAME STATE</span>
+            <div className="snapshot-grid"><b>Q{currentLive.period || "—"}</b><b>{currentLive.clock || "--:--"}</b><span>{currentLive.down || "—"} & {currentLive.distance || "—"}</span><span>{currentLive.ballOn || "Ball position —"}</span><span>{currentLive.possession === "away" ? awayCode || "AWAY" : homeCode || "HOME"} ball</span><span>{awayCode || "AWAY"} {currentLive.awayScore ?? "—"} · {homeCode || "HOME"} {currentLive.homeScore ?? "—"}</span></div>
+            <small className={`source-badge ${currentLive.source}`}>{currentLive.source.toUpperCase()}</small>
+            <button className="secondary-button" onClick={() => openSnapshotEditor("live")}>Adjust Live State</button>
+            {Object.keys(manualLive).length > 0 && <button className="quiet-button" onClick={() => setManualLive({})}>Resume All MQTT</button>}
+            <button className="primary-button mark-play-button" onClick={markPlay}>Mark Play</button>
+            <p>Tap as soon as the play ends to freeze the game state.</p>
+          </div> : <>
+          <section className="marked-snapshot"><div><span className="eyebrow">MARKED PLAY SNAPSHOT</span><small className={`source-badge ${snapshot.source}`}>{snapshot.source.toUpperCase()}</small></div><div className="snapshot-grid"><b>Q{snapshot.period || "—"}</b><b>{snapshot.clock || "--:--"}</b><span>{snapshot.down || "—"} & {snapshot.distance || "—"}</span><span>{snapshot.ballOn || "Ball position —"}</span><span>{snapshot.possession === "away" ? awayCode || "AWAY" : homeCode || "HOME"} ball</span><span>{awayCode || "AWAY"} {snapshot.awayScore ?? "—"} · {homeCode || "HOME"} {snapshot.homeScore ?? "—"}</span></div><div className="snapshot-actions"><button onClick={() => openSnapshotEditor("marked")}>Adjust Snapshot</button><button onClick={() => { if (hasEntryData && !window.confirm("Replace the marked snapshot with the current live state?")) return; const fresh = liveSnapshot(); setSnapshot(fresh); changeOffense(fresh.possession ?? offense); }}>Use Current Live State</button><button onClick={discardMarked}>Cancel Marked Play</button></div></section>
           <div className="possession-toggle" aria-label="Offensive team">
             <button className={offense === "home" ? "selected" : ""} onClick={() => changeOffense("home")}>{homeCode || "HOME"} offense</button>
             <button className={offense === "away" ? "selected" : ""} onClick={() => changeOffense("away")}>{awayCode || "AWAY"} offense</button>
@@ -601,6 +692,7 @@ function PrimaryEntry() {
               </button>
             ))}
           </div>
+          {playType && <>
           {playType === "Pass" ? (
             <div className="form-grid pass-entry-fields">
               <PlayerSelect label="PASSER" roster={activeRoster} value={passerNumber} onChange={setPasserNumber} />
@@ -711,13 +803,14 @@ function PrimaryEntry() {
           </div>
           <div className="save-row">
             <button className="secondary-button" onClick={() => {
-              setPlayType("Run"); setYards("0"); setFirstDown(false);
-              setTouchdown(false); setTurnover(""); setOutOfBounds(false);
+              clearEntry();
               notify("Play entry cleared");
             }}>Clear</button>
-            <div className="next-state">SOURCE <b>{scoreboard.clock ? `Scoreboard · ${scoreboard.clock}` : "Waiting for scoreboard clock"}</b></div>
+            <div className="next-state">FROZEN <b>{snapshot.clock || "No game clock"}</b></div>
             <button className="primary-button" disabled={!activeRoster.length} onClick={savePlay}>{activeRoster.length ? "Save play" : "Add roster first"} <span>→</span></button>
           </div>
+          </>}
+          </>}
         </section>
         <PlayList
           plays={plays}
@@ -745,6 +838,19 @@ function PrimaryEntry() {
           </section>
         </div>
       )}
+      {snapshotModal && snapshotDraft && (() => {
+        const ballMatch = snapshotDraft.ballOn?.match(/^([^\s]+)\s+(\d+)$/);
+        const ballSide = snapshotDraft.ballOn === "50" ? "50" : ballMatch?.[1] === awayCode ? "away" : "home";
+        const ballYard = ballMatch?.[2] || "";
+        const setBall = (side: string, yard = ballYard) => setSnapshotDraft({ ...snapshotDraft, ballOn: side === "50" ? "50" : `${side === "away" ? awayCode || "AWAY" : homeCode || "HOME"} ${Math.max(1, Math.min(49, Number(yard || 1)))}` });
+        return <div className="modal-backdrop" role="presentation" onClick={() => setSnapshotModal(null)}><section className="modal snapshot-modal" role="dialog" aria-modal="true" aria-labelledby="snapshot-title" onClick={(event) => event.stopPropagation()}>
+          <div className="panel-title"><div><span className="eyebrow">{snapshotModal === "live" ? "MANUAL LIVE STATE" : "FROZEN PLAY STATE"}</span><h2 id="snapshot-title">Adjust Snapshot</h2></div><button className="icon-button" aria-label="Close" onClick={() => setSnapshotModal(null)}>×</button></div>
+          <div className="form-grid"><label><span>PERIOD</span><input value={snapshotDraft.period ?? ""} onChange={(event) => setSnapshotDraft({ ...snapshotDraft, period: event.target.value || undefined })} /></label><label><span>CLOCK</span><input value={snapshotDraft.clock ?? ""} onChange={(event) => setSnapshotDraft({ ...snapshotDraft, clock: event.target.value || undefined })} /></label><label><span>DOWN</span><input inputMode="numeric" value={snapshotDraft.down ?? ""} onChange={(event) => setSnapshotDraft({ ...snapshotDraft, down: scoreboardNumber(event.target.value, 1, 4) })} /></label><label><span>DISTANCE</span><input inputMode="numeric" value={snapshotDraft.distance ?? ""} onChange={(event) => setSnapshotDraft({ ...snapshotDraft, distance: scoreboardNumber(event.target.value, 1) })} /></label>
+            <label><span>BALL-ON SIDE</span><select value={ballSide} onChange={(event) => setBall(event.target.value)}><option value="home">{homeCode || "Home"}</option><option value="away">{awayCode || "Away"}</option><option value="50">50</option></select></label>{ballSide !== "50" && <label><span>YARD LINE</span><input inputMode="numeric" min="1" max="49" value={ballYard} onChange={(event) => setBall(ballSide, event.target.value)} /></label>}
+            <label><span>POSSESSION</span><select value={snapshotDraft.possession ?? "home"} onChange={(event) => setSnapshotDraft({ ...snapshotDraft, possession: event.target.value as "home" | "away" })}><option value="home">{homeCode || "Home"}</option><option value="away">{awayCode || "Away"}</option></select></label><label><span>HOME SCORE</span><input inputMode="numeric" value={snapshotDraft.homeScore ?? ""} onChange={(event) => setSnapshotDraft({ ...snapshotDraft, homeScore: scoreboardNumber(event.target.value, 0) })} /></label><label><span>AWAY SCORE</span><input inputMode="numeric" value={snapshotDraft.awayScore ?? ""} onChange={(event) => setSnapshotDraft({ ...snapshotDraft, awayScore: scoreboardNumber(event.target.value, 0) })} /></label>
+          </div><div className="modal-actions"><button className="secondary-button" onClick={() => setSnapshotModal(null)}>Cancel</button><button className="primary-button" onClick={() => { if (snapshotModal === "live") setManualLive({ ...snapshotDraft, capturedAt: undefined, source: undefined }); else { setSnapshot({ ...snapshotDraft, source: snapshot?.source === "mqtt" ? "mixed" : "manual" }); changeOffense(snapshotDraft.possession ?? offense); } setSnapshotModal(null); }}>Apply Changes</button></div>
+        </section></div>;
+      })()}
       {editing && (
         <div className="modal-backdrop" role="presentation" onClick={() => setEditing(null)}>
           <section className="modal" role="dialog" aria-modal="true" aria-labelledby="edit-play-title" onClick={(event) => event.stopPropagation()}>
@@ -756,6 +862,7 @@ function PrimaryEntry() {
               <label><span>DOWN</span><input inputMode="numeric" value={editing.down ?? ""} placeholder="—" onChange={(event) => setEditing({ ...editing, down: event.target.value === "" ? undefined : Number(event.target.value) })} /></label>
               <label><span>DISTANCE</span><input inputMode="numeric" value={editing.distance ?? ""} placeholder="—" onChange={(event) => setEditing({ ...editing, distance: event.target.value === "" ? undefined : Number(event.target.value) })} /></label>
               <label><span>BALL POSITION</span><input value={editing.ballOn ?? ""} placeholder="TAY 35" onChange={(event) => setEditing({ ...editing, ballOn: event.target.value || undefined })} /></label>
+              <label><span>PERIOD</span><input value={editing.period ?? ""} placeholder="1 or OT" onChange={(event) => setEditing({ ...editing, period: event.target.value || undefined })} /></label>
               <label><span>TEAM</span><select value={editing.team ?? "home"} onChange={(event) => setEditing({ ...editing, team: event.target.value as "home" | "away" })}><option value="home">{homeCode || "Home"}</option><option value="away">{awayCode || "Away"}</option></select></label>
               <label><span>PLAY TYPE</span><select value={editing.playType ?? "Run"} onChange={(event) => setEditing({ ...editing, playType: event.target.value })}>{["Run", "Pass", "Penalty", "Special"].map((type) => <option key={type}>{type}</option>)}</select></label>
               {editing.playType === "Pass" ? <>
@@ -1017,11 +1124,68 @@ function TvControl() {
   );
 }
 
+function GameTimeline() {
+  const { plays, homeCode, awayCode, rosterRows, awayRosterRows, scoreboard } = useGame();
+  const [category, setCategory] = useState("All");
+  const [period, setPeriod] = useState("All");
+  const [query, setQuery] = useState("");
+  const categories = ["All", "Scoring", "Turnovers", "Penalties", "Special Teams", "Explosive Plays"];
+  const periods = ["All", "Q1", "Q2", "Q3", "Q4", ...(plays.some((play) => String(play.period).toUpperCase() === "OT") ? ["OT"] : [])];
+  const rosters = { home: rosterRows, away: awayRosterRows };
+  const filtered = filterTimelinePlays(plays, { category, period, query, rosters });
+  const counts = Object.fromEntries(categories.map((item) => [item, filterTimelinePlays(plays, { category: item }).length]));
+  const home = calculateTeamSummary(plays, "home");
+  const away = calculateTeamSummary(plays, "away");
+  const scoring = buildScoringSummary(plays);
+  const drives = buildDriveSummaries(plays);
+  const longest = buildLongestPlaySummary(plays);
+  const redZone = buildRedZoneSummary(plays, { home: homeCode, away: awayCode });
+  const explosive = (team: "home" | "away", type: "Run" | "Pass") => plays.filter((play) => (play.team ?? "home") === team && play.playType === type && isExplosivePlay(play)).length;
+  const teamLabel = (team?: string) => team === "away" ? awayCode || "AWAY" : homeCode || "HOME";
+  const longValue = (play: Play | null, field: "yards" | "distance" | "returnYards") => !play ? "—" : field === "yards" ? `${play.yards ?? 0} yd` : `${play.details?.specialTeams?.[field] ?? 0} yd`;
+  return <main className="timeline-page">
+    <section className="timeline-sticky">
+      <div className="timeline-overview">
+        <div><small>SCORE</small><b>{awayCode || "AWAY"} {String(scoreboard.away_score || 0)} · {homeCode || "HOME"} {String(scoreboard.home_score || 0)}</b></div>
+        <div><small>OFFENSE</small><b>{away.plays} plays / {away.yards} yd · {home.plays} plays / {home.yards} yd</b></div>
+        <div><small>TURNOVERS</small><b>{away.turnovers} · {home.turnovers}</b></div>
+        <div><small>3RD / 4TH</small><b>{away.thirdDownConversions}/{away.thirdDownAttempts} · {away.fourthDownConversions}/{away.fourthDownAttempts} | {home.thirdDownConversions}/{home.thirdDownAttempts} · {home.fourthDownConversions}/{home.fourthDownAttempts}</b></div>
+      </div>
+      <div className="timeline-filter-row">{categories.map((item) => <button key={item} className={category === item ? "selected" : ""} onClick={() => setCategory(item)}>{item} <b>{counts[item]}</b></button>)}</div>
+      <div className="timeline-filter-row compact">{periods.map((item) => <button key={item} className={period === item ? "selected" : ""} onClick={() => setPeriod(item)}>{item}</button>)}<input aria-label="Search timeline" placeholder="Search player, # or description" value={query} onChange={(event) => setQuery(event.target.value)} /></div>
+    </section>
+    <div className="timeline-layout">
+      <section className="panel timeline-list">
+        <div className="panel-title"><div><span className="eyebrow">FULL GAME</span><h1>{filtered.length} timeline entries</h1></div></div>
+        {filtered.map((play) => {
+          const special = play.details?.specialTeams;
+          const marker = isScoringPlay(play) ? "SCORING" : isTurnoverPlay(play) ? "TURNOVER" : play.playType === "Penalty" ? "PENALTY" : isSpecialTeamsPlay(play) ? "SPECIAL" : isExplosivePlay(play) ? "EXPLOSIVE" : "PLAY";
+          const down = play.down ? `${play.down}${play.down === 1 ? "st" : play.down === 2 ? "nd" : play.down === 3 ? "rd" : "th"}${play.distance ? ` & ${play.distance}` : ""}` : "";
+          return <article className={`timeline-item ${marker.toLowerCase()} ${play.id === plays.at(-1)?.id ? "latest" : ""}`} key={play.id}>
+            <div className="timeline-meta"><b>#{play.id}</b><span>{play.period ? `Q${play.period}`.replace("QOT", "OT") : "Period —"} {play.clock || "--:--"} · {teamLabel(play.team)}{down ? ` · ${down}` : ""}{play.ballOn ? ` at ${play.ballOn}` : ""}</span><em>{marker}</em></div>
+            <strong>{play.description}</strong>
+            <small>{play.tag || special?.result || ""} · {play.status === "confirmed" ? "Detail confirmed" : "Needs detail"}</small>
+          </article>;
+        })}
+        {!filtered.length && <p className="empty-panel-copy">No plays match these timeline filters.</p>}
+      </section>
+      <aside className="timeline-sidebar">
+        <section className="panel timeline-card"><span className="eyebrow">SCORING SUMMARY</span>{scoring.map((event) => <p key={event.playId}><b>{event.period ? `Q${event.period}` : "—"} {event.clock}</b> · {teamLabel(event.team)} · {event.type}<small>{event.description}</small></p>)}{!scoring.length && <p>No scoring plays.</p>}</section>
+        <section className="panel timeline-card"><span className="eyebrow">LONGEST PLAYS</span><p>{homeCode || "HOME"}: Run {longValue(longest.home.run, "yards")} · Pass {longValue(longest.home.completion, "yards")}</p><p>{awayCode || "AWAY"}: Run {longValue(longest.away.run, "yards")} · Pass {longValue(longest.away.completion, "yards")}</p><p>Punt {longValue(longest.punt, "distance")} · PR {longValue(longest.puntReturn, "returnYards")} · KR {longValue(longest.kickoffReturn, "returnYards")}</p></section>
+        <section className="panel timeline-card"><span className="eyebrow">EXPLOSIVE PLAYS</span><p>{homeCode || "HOME"}: {explosive("home", "Run")} run · {explosive("home", "Pass")} pass</p><p>{awayCode || "AWAY"}: {explosive("away", "Run")} run · {explosive("away", "Pass")} pass</p></section>
+        <section className="panel timeline-card"><span className="eyebrow">RED ZONE</span><p>{homeCode || "HOME"}: {redZone.home.touchdowns}/{redZone.home.trips} TD · {redZone.home.fieldGoals} FG · {redZone.home.empty} empty</p><p>{awayCode || "AWAY"}: {redZone.away.touchdowns}/{redZone.away.trips} TD · {redZone.away.fieldGoals} FG · {redZone.away.empty} empty</p></section>
+        <section className="panel timeline-card drives"><span className="eyebrow">INFERRED DRIVES</span>{drives.map((drive) => <p key={drive.number}><b>#{drive.number} {teamLabel(drive.team)}</b> · {drive.plays} plays · {drive.yards} yd<small>{drive.startPeriod ? `Q${drive.startPeriod}` : "—"} {drive.startClock || "--:--"} → {drive.endClock || "--:--"} · {drive.result}</small></p>)}</section>
+      </aside>
+    </div>
+  </main>;
+}
+
 function Admin() {
   const {
     homeName, setHomeName, awayName, setAwayName, homeCode, setHomeCode,
     awayCode, setAwayCode, rosterRows, setRosterRows, awayRosterRows,
     setAwayRosterRows, scoreboard, backendOnline, saveGame, saveRoster, notify,
+    plays, exportCurrentGame, resetGame,
   } = useGame();
   const [tested, setTested] = useState(false);
   const [rosterText, setRosterText] = useState(rosterRows.map((row) => row.join("\t")).join("\n"));
@@ -1030,6 +1194,13 @@ function Admin() {
   const [awayRosterDirty, setAwayRosterDirty] = useState(false);
   const [previewRows, setPreviewRows] = useState<string[][] | null>(null);
   const [previewTeam, setPreviewTeam] = useState<"home" | "away">("home");
+  const [resetOpen, setResetOpen] = useState(false);
+  const [resetChoice, setResetChoice] = useState<"keep" | "clear" | "">("");
+  const [resetAcknowledged, setResetAcknowledged] = useState(false);
+  const [resetConfirmation, setResetConfirmation] = useState("");
+  const [lastExport, setLastExport] = useState<Date | null>(null);
+  const performExport = async () => { if (await exportCurrentGame()) setLastExport(new Date()); };
+  const resetReady = Boolean(resetChoice) && resetAcknowledged && resetConfirmation === "NEW GAME";
   const displayedHomeRoster = homeRosterDirty ? rosterText : rosterRows.map((row) => row.join("\t")).join("\n");
   const displayedAwayRoster = awayRosterDirty ? awayRosterText : awayRosterRows.map((row) => row.join("\t")).join("\n");
   return (
@@ -1092,6 +1263,18 @@ function Admin() {
           notify("Configuration looks valid — live connection testing requires the Windows backend");
         }}>{tested ? "✓ Configuration valid" : "Check configuration"}</button>
       </aside>
+      <section className="panel setup-card">
+        <span className="eyebrow">GAME MANAGEMENT</span><h2>Current game</h2>
+        <div className="stat-summary">
+          <b>{homeName || "Home team not set"} vs {awayName || "Away team not set"}</b>
+          <b>{plays.length} recorded plays</b>
+          <b>{plays.filter((play) => play.status === "confirmed").length} with confirmed detail</b>
+          {lastExport && <span>Last exported this session: {lastExport.toLocaleTimeString()}</span>}
+        </div>
+        <button className="secondary-button wide" onClick={performExport}>Export Current Game</button>
+        <div className="empty-callout"><b>!</b><span><strong>Start New Game</strong><small>This permanently removes the current game’s plays and statistics. Export first if you may need them later.</small></span></div>
+        <button className="danger-button wide" onClick={() => { setResetOpen(true); setResetChoice(""); setResetAcknowledged(false); setResetConfirmation(""); }}>Start New Game</button>
+      </section>
       {previewRows && (
         <div className="modal-backdrop" role="presentation" onClick={() => setPreviewRows(null)}>
           <section className="modal roster-modal" role="dialog" aria-modal="true" aria-labelledby="roster-preview-title" onClick={(event) => event.stopPropagation()}>
@@ -1118,6 +1301,26 @@ function Admin() {
           </section>
         </div>
       )}
+      {resetOpen && (
+        <div className="modal-backdrop" role="presentation" onClick={() => setResetOpen(false)}>
+          <section className="modal" role="dialog" aria-modal="true" aria-labelledby="new-game-title" onClick={(event) => event.stopPropagation()}>
+            <div className="panel-title"><div><span className="eyebrow">DANGER ZONE</span><h2 id="new-game-title">Start New Game</h2></div><button className="icon-button" aria-label="Close" onClick={() => setResetOpen(false)}>×</button></div>
+            <div className="reset-step"><span className="eyebrow">1 · EXPORT</span><button className="secondary-button wide" onClick={performExport}>Export Current Game</button><small>Last export: {lastExport ? lastExport.toLocaleTimeString() : "Not exported this session"}</small></div>
+            <div className="reset-step"><span className="eyebrow">2 · CHOOSE WHAT TO KEEP</span><div className="reset-options" role="radiogroup" aria-label="New game reset option">
+              <button role="radio" aria-checked={resetChoice === "keep"} className={resetChoice === "keep" ? "selected" : ""} onClick={() => setResetChoice("keep")}><b>Keep teams and rosters</b><small>Clear plays and statistics</small></button>
+              <button role="radio" aria-checked={resetChoice === "clear"} className={resetChoice === "clear" ? "selected" : ""} onClick={() => setResetChoice("clear")}><b>Clear everything</b><small>Also clear teams and rosters</small></button>
+            </div></div>
+            <div className="reset-step"><span className="eyebrow">3 · CONFIRM</span>
+              <label className="reset-check"><input type="checkbox" checked={resetAcknowledged} onChange={(event) => setResetAcknowledged(event.target.checked)} /><span>I understand this permanently deletes the current game data</span></label>
+              <label><span>TYPE NEW GAME</span><input value={resetConfirmation} onChange={(event) => setResetConfirmation(event.target.value)} /></label>
+            </div>
+            <div className="modal-actions">
+              <button className="secondary-button" onClick={() => setResetOpen(false)}>Cancel</button>
+              <button className="danger-button" disabled={!resetReady} onClick={async () => { if (await resetGame(resetChoice === "keep", resetConfirmation)) setResetOpen(false); }}>Start New Game</button>
+            </div>
+          </section>
+        </div>
+      )}
     </main>
   );
 }
@@ -1127,6 +1330,7 @@ function TommyTvApp() {
   const screen = useMemo(() => {
     if (role === "entry-detail") return <DetailEntry />;
     if (role === "pxp") return <PxpPanel />;
+    if (role === "timeline") return <GameTimeline />;
     if (role === "control") return <TvControl />;
     if (role === "admin") return <Admin />;
     return <PrimaryEntry />;

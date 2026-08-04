@@ -102,6 +102,7 @@ test("persists game, rosters, MQTT state, plays, and defensive detail", async (t
     down: 2,
     distance: 6,
     ballOn: "TAY 35",
+    period: "3",
     description: "#22 Jalen Price rush for 8 yards",
     tag: "FIRST DOWN",
     playType: "Run",
@@ -122,9 +123,13 @@ test("persists game, rosters, MQTT state, plays, and defensive detail", async (t
   assert.equal(state.scoreboard.payload.clock, "08:42");
   assert.equal(state.plays[0].team, "home");
   assert.equal(state.plays[0].yards, 8);
-  assert.deepEqual({ down: state.plays[0].down, distance: state.plays[0].distance, ballOn: state.plays[0].ballOn }, { down: 2, distance: 6, ballOn: "TAY 35" });
+  assert.deepEqual({ down: state.plays[0].down, distance: state.plays[0].distance, ballOn: state.plays[0].ballOn, period: state.plays[0].period }, { down: 2, distance: 6, ballOn: "TAY 35", period: "3" });
   assert.equal(state.plays[0].status, "confirmed");
   assert.deepEqual(state.plays[0].details.tacklers, ["21"]);
+
+  await request("/api/test/mqtt", "POST", { clock: "07:55", period: "4", down: "1", to_go: "10", ball_on: "LIN 20" });
+  const afterLiveUpdate = await request("/api/state");
+  assert.deepEqual({ clock: afterLiveUpdate.plays[0].clock, period: afterLiveUpdate.plays[0].period, down: afterLiveUpdate.plays[0].down, distance: afterLiveUpdate.plays[0].distance, ballOn: afterLiveUpdate.plays[0].ballOn }, { clock: "08:42", period: "3", down: 2, distance: 6, ballOn: "TAY 35" });
 
   await request("/api/plays/1", "PUT", {
     clock: "08:31",
@@ -132,6 +137,7 @@ test("persists game, rosters, MQTT state, plays, and defensive detail", async (t
     down: 3,
     distance: 10,
     ballOn: "TAY 43",
+    period: "4",
     description: "regenerated from structured fields",
     tag: "FIRST DOWN",
     team: "away",
@@ -149,7 +155,7 @@ test("persists game, rosters, MQTT state, plays, and defensive detail", async (t
   assert.equal(correctedState.plays[0].receiverNumber, "80");
   assert.equal(correctedState.plays[0].passResult, "Complete");
   assert.equal(correctedState.plays[0].yards, 12);
-  assert.deepEqual({ down: correctedState.plays[0].down, distance: correctedState.plays[0].distance, ballOn: correctedState.plays[0].ballOn }, { down: 3, distance: 10, ballOn: "TAY 43" });
+  assert.deepEqual({ down: correctedState.plays[0].down, distance: correctedState.plays[0].distance, ballOn: correctedState.plays[0].ballOn, period: correctedState.plays[0].period }, { down: 3, distance: 10, ballOn: "TAY 43", period: "4" });
   assert.equal(correctedState.plays[0].description, "#4 Drew Collins complete to #80 Sam Reed for 12 yards");
   assert.deepEqual(correctedState.plays[0].details.tacklers, ["21"]);
 
@@ -249,9 +255,44 @@ test("persists game, rosters, MQTT state, plays, and defensive detail", async (t
   child = startServer();
   await waitForServer(child);
   const restartedState = await request("/api/state");
-  assert.deepEqual({ down: restartedState.plays[0].down, distance: restartedState.plays[0].distance, ballOn: restartedState.plays[0].ballOn }, { down: 3, distance: 10, ballOn: "TAY 43" });
+  assert.deepEqual({ down: restartedState.plays[0].down, distance: restartedState.plays[0].distance, ballOn: restartedState.plays[0].ballOn, period: restartedState.plays[0].period }, { down: 3, distance: 10, ballOn: "TAY 43", period: "4" });
 
-  await request("/api/plays/1", "DELETE");
-  const emptyState = await request("/api/state");
-  assert.equal(emptyState.plays.length, detailedState.plays.length - 1);
+  await request("/api/game", "PUT", { homeName: "Taylorville / Tornadoes", awayName: "Lincoln: Railsplitters", homeCode: "TAY", awayCode: "LIN" });
+  const exportResponse = await fetch(`${baseUrl}/api/export`);
+  assert.equal(exportResponse.status, 200);
+  assert.match(exportResponse.headers.get("content-disposition"), /2026-\d\d-\d\d_Taylorville_Tornadoes_vs_Lincoln_Railsplitters\.json/);
+  const exported = await exportResponse.json();
+  assert.equal(exported.formatVersion, 1);
+  assert.equal(exported.game.homeName, "Taylorville / Tornadoes");
+  assert.equal(exported.rosters.home[0][0], "5");
+  assert.deepEqual({ down: exported.plays[0].down, distance: exported.plays[0].distance, ballOn: exported.plays[0].ballOn, period: exported.plays[0].period }, { down: 3, distance: 10, ballOn: "TAY 43", period: "4" });
+  assert.ok(exported.plays.some((play) => play.details.defensiveCredits));
+  assert.ok(exported.plays.some((play) => play.details.turnoverDetail));
+  assert.ok(exported.plays.some((play) => play.details.penalty));
+  assert.ok(exported.plays.some((play) => play.details.specialTeams));
+
+  await rejected("/api/game/reset", "POST", {});
+  await rejected("/api/game/reset", "POST", { confirmation: "new game", keepTeamsAndRosters: true });
+  assert.equal((await request("/api/state")).plays.length, restartedState.plays.length);
+
+  const eventResponse = await fetch(`${baseUrl}/api/events`);
+  const eventReader = eventResponse.body.getReader();
+  await eventReader.read(); // Initial state event.
+  const kept = await request("/api/game/reset", "POST", { confirmation: "NEW GAME", keepTeamsAndRosters: true });
+  const resetEvent = new TextDecoder().decode((await eventReader.read()).value);
+  assert.match(resetEvent, /"plays":\[\]/);
+  await eventReader.cancel();
+  assert.equal(kept.plays.length, 0);
+  assert.equal(kept.game.homeName, "Taylorville / Tornadoes");
+  assert.equal(kept.rosters.home.length, 4);
+  assert.deepEqual(kept.scoreboard.payload, {});
+
+  await request("/api/plays", "POST", { team: "home", playType: "Run", playerNumber: "22", yards: 4, down: 1, distance: 10, ballOn: "TAY 20" });
+  assert.equal((await request("/api/state")).plays.length, 1);
+  const cleared = await request("/api/game/reset", "POST", { confirmation: "NEW GAME", keepTeamsAndRosters: false });
+  assert.equal(cleared.plays.length, 0);
+  assert.deepEqual(cleared.game, { homeName: "", awayName: "", homeCode: "", awayCode: "" });
+  assert.deepEqual(cleared.rosters, { home: [], away: [] });
+  const emptyExport = await (await fetch(`${baseUrl}/api/export`)).json();
+  assert.equal(emptyExport.plays.length, 0);
 });
