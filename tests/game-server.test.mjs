@@ -236,6 +236,7 @@ test("persists game, rosters, MQTT state, plays, and defensive detail", async (t
   assert.equal(afterInvalidEdit.plays.find((play) => play.id === completed.id).yards, 40);
 
   for (const invalid of [
+    { playType: "Run", playerNumber: "22", yards: 1 },
     { team: "home", playType: "Run", playerNumber: "22", yards: 1, down: 0 },
     { team: "home", playType: "Run", playerNumber: "22", yards: 1, down: 5 },
     { team: "home", playType: "Run", playerNumber: "22", yards: 1, distance: -1 },

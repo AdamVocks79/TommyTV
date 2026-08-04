@@ -369,11 +369,12 @@ function Header({
   );
 }
 
-function FieldState({ live, marked, onAdjustLive, onResumeMqtt, hasManualLive = false }: {
+function FieldState({ live, marked, onAdjustLive, onResumeMqtt, onToggleOffense, hasManualLive = false }: {
   live?: PlaySnapshot;
   marked?: PlaySnapshot | null;
   onAdjustLive?: () => void;
   onResumeMqtt?: () => void;
+  onToggleOffense?: () => void;
   hasManualLive?: boolean;
 } = {}) {
   const { scoreboard, homeCode, awayCode, plays } = useGame();
@@ -394,7 +395,8 @@ function FieldState({ live, marked, onAdjustLive, onResumeMqtt, hasManualLive = 
         <div><small>DOWN</small><strong>{String(state?.down || scoreboard.down || "–")}</strong></div>
         <div><small>TO GO</small><strong>{String(state?.distance || scoreboard.to_go || "–")}</strong></div>
         <div><small>BALL ON</small><strong>{String(state?.ballOn || scoreboard.ball_on || "–")}</strong></div>
-        <div><small>POSSESSION</small><strong className="possession">{possession}</strong></div>
+        {onToggleOffense ? <button className="offense-toggle" aria-label={`Toggle offense between ${homeCode || "home"} and ${awayCode || "away"}`} onClick={onToggleOffense} disabled={!homeCode || !awayCode}><small>OFFENSE</small><strong className="possession">{possession}</strong><span>Tap to change</span></button>
+          : <div><small>OFFENSE</small><strong className="possession">{possession}</strong></div>}
       </div>
       <div className="field-state-status">
         {state ? <span className="state-mode">{marked ? <>MARKED PLAY · Q{marked.period || "—"} {marked.clock || "--:--"}</> : "LIVE"}</span> : <span className="state-mode">{plays.length} PLAYS LOGGED</span>}
@@ -472,9 +474,6 @@ function PrimaryEntry() {
     plays, rosterRows, awayRosterRows, homeCode, awayCode, scoreboard,
     createPlay, updatePlay, deletePlay, notify,
   } = useGame();
-  const [offense, setOffense] = useState<"home" | "away">(
-    scoreboard.away_possession ? "away" : "home"
-  );
   const [playType, setPlayType] = useState("");
   const [snapshot, setSnapshot] = useState<PlaySnapshot | null>(null);
   const [snapshotModal, setSnapshotModal] = useState<"live" | "marked" | null>(null);
@@ -483,8 +482,11 @@ function PrimaryEntry() {
   const [passResult, setPassResult] = useState<PassResult>("Complete");
   const [passerNumber, setPasserNumber] = useState("");
   const [receiverNumber, setReceiverNumber] = useState("");
-  const activeRoster = offense === "home" ? rosterRows : awayRosterRows;
-  const [player, setPlayer] = useState(activeRoster[0] ?? ["00", "Roster needed", ""]);
+  const scoreboardOffense: "home" | "away" | undefined = scoreboard.away_possession ? "away" : scoreboard.home_possession ? "home" : undefined;
+  const liveOffense = manualLive.possession ?? scoreboardOffense;
+  const activeOffense = snapshot?.possession ?? liveOffense;
+  const activeRoster = useMemo(() => activeOffense === "home" ? rosterRows : activeOffense === "away" ? awayRosterRows : [], [activeOffense, awayRosterRows, rosterRows]);
+  const [player, setPlayer] = useState<string[]>(["00", "Choose player", ""]);
   const [recentPlayers, setRecentPlayers] = useState<Record<"home" | "away", string[][]>>({ home: [], away: [] });
   const [jerseyEntry, setJerseyEntry] = useState("");
   const [rosterPickerOpen, setRosterPickerOpen] = useState(false);
@@ -500,7 +502,7 @@ function PrimaryEntry() {
   const [returnYards, setReturnYards] = useState("0");
   const [tryType, setTryType] = useState("PAT kick");
   const [penaltyName, setPenaltyName] = useState("");
-  const [penaltyTeam, setPenaltyTeam] = useState<"home" | "away">(offense);
+  const [penaltyTeam, setPenaltyTeam] = useState<"home" | "away">("home");
   const [penaltyAccepted, setPenaltyAccepted] = useState(true);
   const [penaltyFirstDown, setPenaltyFirstDown] = useState(false);
   const [penaltyPlayCounts, setPenaltyPlayCounts] = useState(false);
@@ -511,19 +513,18 @@ function PrimaryEntry() {
     const manual = Object.keys(manualLive).some((key) => !["capturedAt", "source"].includes(key));
     const mqtt = Boolean(scoreboard._connected);
     const value = <T,>(field: keyof PlaySnapshot, fallback: T) => manualLive[field] !== undefined ? manualLive[field] as T : fallback;
-    const possession = scoreboard.away_possession ? "away" : scoreboard.home_possession ? "home" : offense;
     return {
       period: value("period", String(scoreboard.period || "").trim() || undefined),
       clock: value("clock", String(scoreboard.clock || "").trim() || undefined),
       down: value("down", scoreboardNumber(scoreboard.down, 1, 4)),
       distance: value("distance", scoreboardNumber(scoreboard.to_go, 1)),
       ballOn: value("ballOn", String(scoreboard.ball_on || "").trim() || undefined),
-      possession: value("possession", possession),
+      possession: value("possession", scoreboardOffense),
       homeScore: value("homeScore", scoreboardNumber(scoreboard.home_score, 0)),
       awayScore: value("awayScore", scoreboardNumber(scoreboard.away_score, 0)),
       capturedAt: new Date().toISOString(), source: manual && mqtt ? "mixed" : manual ? "manual" : mqtt ? "mqtt" : "unavailable",
     };
-  }, [manualLive, offense, scoreboard]);
+  }, [manualLive, scoreboard, scoreboardOffense]);
 
   function clearEntry() {
     setPlayType(""); setYards("0"); setFirstDown(false); setTouchdown(false); setTurnover(""); setOutOfBounds(false);
@@ -531,7 +532,8 @@ function PrimaryEntry() {
   }
   function markPlay() {
     const frozen = liveSnapshot();
-    setSnapshot(frozen); changeOffense(frozen.possession ?? offense); sessionStorage.setItem("tommytv-pending-play", "1");
+    if (!frozen.possession) return notify("Set the offense before marking the play");
+    setPenaltyTeam(frozen.possession); setSnapshot(frozen); sessionStorage.setItem("tommytv-pending-play", "1");
   }
   function discardMarked() {
     if (hasEntryData && !window.confirm("Discard this marked play and all unsaved entry data?")) return;
@@ -549,14 +551,14 @@ function PrimaryEntry() {
   }, [plays.length, snapshot]);
   const activePlayer = useMemo(() => activeRoster.some((row) => samePlayer(row, player))
     ? player
-    : activeRoster[0] ?? ["00", "Roster needed", ""], [activeRoster, player]);
+    : ["00", "Choose player", ""], [activeRoster, player]);
   const numberMatches = useMemo(() => jerseyMatches(activeRoster, jerseyEntry), [activeRoster, jerseyEntry]);
   const quickPlayers = useMemo(() => {
     const sorted = sortRoster(activeRoster);
     const prioritized = [
       activePlayer,
       ...numberMatches,
-      ...recentPlayers[offense],
+      ...(activeOffense ? recentPlayers[activeOffense] : []),
       ...sorted.filter((row) => positionMatches(playType, row[2] ?? "")),
       ...sorted,
     ];
@@ -564,7 +566,7 @@ function PrimaryEntry() {
       activeRoster.some((candidate) => samePlayer(candidate, row)) &&
       prioritized.findIndex((candidate) => samePlayer(candidate, row)) === index
     ).slice(0, 8);
-  }, [activePlayer, activeRoster, numberMatches, offense, playType, recentPlayers]);
+  }, [activePlayer, activeOffense, activeRoster, numberMatches, playType, recentPlayers]);
   const filteredRoster = useMemo(() => {
     const query = rosterFilter.trim().toLowerCase();
     return sortRoster(activeRoster).filter((row) =>
@@ -572,27 +574,43 @@ function PrimaryEntry() {
     );
   }, [activeRoster, rosterFilter]);
 
-  function changeOffense(nextOffense: "home" | "away") {
+  function revalidatePlayers(nextOffense: "home" | "away") {
     const nextRoster = nextOffense === "home" ? rosterRows : awayRosterRows;
-    setOffense(nextOffense);
-    setPenaltyTeam(nextOffense);
+    const receivingRoster = nextOffense === "home" ? awayRosterRows : rosterRows;
+    const invalidPlayer = !nextRoster.some((row) => samePlayer(row, player)) && player[0] !== "00";
+    const invalidPasser = Boolean(passerNumber) && !nextRoster.some((row) => row[0] === passerNumber);
+    const invalidReceiver = Boolean(receiverNumber) && !nextRoster.some((row) => row[0] === receiverNumber);
+    const invalidReturner = Boolean(returnerNumber) && !receivingRoster.some((row) => row[0] === returnerNumber);
+    if (invalidPlayer) setPlayer(["00", "Choose player", ""]);
+    if (invalidPasser) setPasserNumber("");
+    if (invalidReceiver) setReceiverNumber("");
+    if (invalidReturner) setReturnerNumber("");
     setJerseyEntry("");
     setRosterFilter("");
     setRosterPickerOpen(false);
-    setPasserNumber("");
-    setReceiverNumber("");
-    setPlayer((current) => nextRoster.some((row) => samePlayer(row, current))
-      ? current
-      : nextRoster[0] ?? ["00", "Roster needed", ""]);
+    if (invalidPlayer || invalidPasser || invalidReceiver || invalidReturner) notify("Player selection cleared after offense changed");
+  }
+
+  function toggleOffense() {
+    if (!homeCode || !awayCode) return notify("Set up both teams before choosing offense");
+    const current = snapshot?.possession ?? liveOffense;
+    const nextOffense = current === "home" ? "away" : "home";
+    if (snapshot) {
+      revalidatePlayers(nextOffense);
+      setSnapshot({ ...snapshot, possession: nextOffense, source: snapshot.source === "mqtt" ? "mixed" : "manual" });
+    } else {
+      setManualLive((value) => ({ ...value, possession: nextOffense }));
+    }
   }
 
   function selectPlayer(nextPlayer: string[]) {
+    if (!activeOffense) return;
     setPlayer(nextPlayer);
     setJerseyEntry("");
     setRosterPickerOpen(false);
     setRecentPlayers((current) => ({
       ...current,
-      [offense]: [nextPlayer, ...current[offense].filter((row) => !samePlayer(row, nextPlayer))].slice(0, 4),
+      [activeOffense]: [nextPlayer, ...current[activeOffense].filter((row) => !samePlayer(row, nextPlayer))].slice(0, 4),
     }));
   }
 
@@ -625,6 +643,7 @@ function PrimaryEntry() {
 
   async function savePlay() {
     if (!snapshot) return notify("Mark the play first");
+    if (!snapshot.possession) return notify("Set the offense before saving the play");
     const verb: Record<string, string> = {
       Run: "rush",
       Pass: "pass",
@@ -660,7 +679,7 @@ function PrimaryEntry() {
       down: snapshot.down, distance: snapshot.distance, ballOn: snapshot.ballOn, period: snapshot.period,
       description,
       tag: touchdown ? "TOUCHDOWN" : playType === "Pass" && passResult === "Interception" ? "INTERCEPTION" : turnover || (firstDown ? "FIRST DOWN" : undefined),
-      team: offense,
+      team: snapshot.possession,
       playType,
       playerNumber: playType === "Pass" ? "" : activePlayer[0],
       passerNumber: playType === "Pass" ? passerNumber : undefined,
@@ -684,6 +703,7 @@ function PrimaryEntry() {
         marked={snapshot}
         onAdjustLive={() => openSnapshotEditor("live")}
         onResumeMqtt={() => setManualLive({})}
+        onToggleOffense={toggleOffense}
         hasManualLive={Object.keys(manualLive).length > 0}
       />
       <div className="workspace entry-workspace">
@@ -692,17 +712,13 @@ function PrimaryEntry() {
             <div><span className="eyebrow">NEXT PLAY · {plays.length + 1}</span><h1>What happened?</h1></div>
             {snapshot ? <div className="marked-header-tools">
               <span className="operator">PRIMARY · AV</span>
-              <div className="marked-actions" aria-label="Marked play actions"><button aria-label="Adjust marked play snapshot" onClick={() => openSnapshotEditor("marked")}>Adjust</button><button aria-label="Replace marked snapshot with current live state" onClick={() => { if (hasEntryData && !window.confirm("Replace the marked snapshot with the current live state?")) return; const fresh = liveSnapshot(); setSnapshot(fresh); changeOffense(fresh.possession ?? offense); }}>Use Live State</button><button aria-label="Cancel marked play" onClick={discardMarked}>Cancel</button></div>
+              <div className="marked-actions" aria-label="Marked play actions"><button aria-label="Adjust marked play snapshot" onClick={() => openSnapshotEditor("marked")}>Adjust</button><button aria-label="Replace marked snapshot with current live state" onClick={() => { if (hasEntryData && !window.confirm("Replace the marked snapshot with the current live state?")) return; const fresh = liveSnapshot(); if (!fresh.possession) return notify("Set the live offense first"); revalidatePlayers(fresh.possession); setSnapshot(fresh); }}>Use Live State</button><button aria-label="Cancel marked play" onClick={discardMarked}>Cancel</button></div>
             </div> : <span className="operator">PRIMARY · AV</span>}
           </div>
           {!snapshot ? <div className="mark-idle">
             <button className="primary-button mark-play-button" onClick={markPlay}>Mark Play</button>
             <p>Tap as soon as the play ends to freeze the game state.</p>
           </div> : <>
-          <div className="possession-toggle" aria-label="Offensive team">
-            <button className={offense === "home" ? "selected" : ""} onClick={() => changeOffense("home")}>{homeCode || "HOME"} offense</button>
-            <button className={offense === "away" ? "selected" : ""} onClick={() => changeOffense("away")}>{awayCode || "AWAY"} offense</button>
-          </div>
           <div className="segmented">
             {["Run", "Pass", "Penalty", "Special"].map((type) => (
               <button
@@ -737,7 +753,7 @@ function PrimaryEntry() {
             <label><span>TYPE</span><select value={specialSubtype} onChange={(event) => { const subtype = event.target.value; setSpecialSubtype(subtype); setSpecialResult(subtype === "Try" ? "Made" : subtype === "Field goal" ? "Made" : "Returned"); }}><option>Punt</option><option>Kickoff</option><option>Field goal</option><option>Try</option></select></label>
             {specialSubtype === "Try" && <label><span>TRY TYPE</span><select value={tryType} onChange={(event) => setTryType(event.target.value)}><option>PAT kick</option><option>Two-point run</option><option>Two-point pass</option></select></label>}
             <label><span>RESULT</span><select value={specialResult} onChange={(event) => setSpecialResult(event.target.value)}>{(specialSubtype === "Punt" ? ["Returned", "Fair catch", "Touchback", "Downed", "Out of bounds", "Blocked"] : specialSubtype === "Kickoff" ? ["Returned", "Touchback", "Out of bounds", "Onside kicking team", "Onside receiving team"] : ["Made", "Missed", "Blocked", "Failed"].filter((item) => specialSubtype === "Try" ? ["Made", "Failed"].includes(item) : !["Failed"].includes(item))).map((item) => <option key={item}>{item}</option>)}</select></label>
-            {specialResult === "Returned" && <><PlayerSelect label="RETURNER" roster={offense === "home" ? awayRosterRows : rosterRows} value={returnerNumber} onChange={setReturnerNumber} /><label><span>RETURN YARDS</span><input inputMode="numeric" value={returnYards} onChange={(event) => setReturnYards(event.target.value.replace(/[^0-9]/g, ""))} /></label></>}
+            {specialResult === "Returned" && <><PlayerSelect label="RETURNER" roster={activeOffense === "home" ? awayRosterRows : rosterRows} value={returnerNumber} onChange={setReturnerNumber} /><label><span>RETURN YARDS</span><input inputMode="numeric" value={returnYards} onChange={(event) => setReturnYards(event.target.value.replace(/[^0-9]/g, ""))} /></label></>}
             {specialSubtype === "Try" && tryType === "Two-point pass" && <><PlayerSelect label="PASSER" roster={activeRoster} value={passerNumber} onChange={setPasserNumber} /><PlayerSelect label="RECEIVER" roster={activeRoster} value={receiverNumber} onChange={setReceiverNumber} /></>}
           </div>}
           {(playType === "Run" || (playType === "Special" && !(specialSubtype === "Try" && tryType === "Two-point pass"))) && <><label className="section-label">{playType === "Run" ? "BALL CARRIER" : specialSubtype === "Punt" ? "PUNTER" : specialSubtype === "Try" && tryType === "Two-point run" ? "RUNNER" : "KICKER"}</label>
@@ -847,7 +863,7 @@ function PrimaryEntry() {
       {rosterPickerOpen && (
         <div className="modal-backdrop" role="presentation" onClick={() => setRosterPickerOpen(false)}>
           <section className="modal roster-picker-modal" role="dialog" aria-modal="true" aria-labelledby="roster-picker-title" onClick={(event) => event.stopPropagation()}>
-            <div className="panel-title"><div><span className="eyebrow">{offense === "home" ? homeCode || "HOME" : awayCode || "AWAY"} ROSTER</span><h2 id="roster-picker-title">Choose a player</h2></div><button className="icon-button" aria-label="Close player picker" onClick={() => setRosterPickerOpen(false)}>×</button></div>
+            <div className="panel-title"><div><span className="eyebrow">{activeOffense === "home" ? homeCode || "HOME" : awayCode || "AWAY"} ROSTER</span><h2 id="roster-picker-title">Choose a player</h2></div><button className="icon-button" aria-label="Close player picker" onClick={() => setRosterPickerOpen(false)}>×</button></div>
             <label className="roster-search"><span>FILTER BY NUMBER OR NAME</span><input autoFocus value={rosterFilter} onChange={(event) => setRosterFilter(event.target.value)} placeholder="Example: 22 or Martin" /></label>
             <div className="full-roster-grid">
               {filteredRoster.map((item, index) => (
@@ -869,8 +885,8 @@ function PrimaryEntry() {
           <div className="panel-title"><div><span className="eyebrow">{snapshotModal === "live" ? "MANUAL LIVE STATE" : "FROZEN PLAY STATE"}</span><h2 id="snapshot-title">Adjust Snapshot</h2></div><button className="icon-button" aria-label="Close" onClick={() => setSnapshotModal(null)}>×</button></div>
           <div className="form-grid"><label><span>PERIOD</span><input value={snapshotDraft.period ?? ""} onChange={(event) => setSnapshotDraft({ ...snapshotDraft, period: event.target.value || undefined })} /></label><label><span>CLOCK</span><input value={snapshotDraft.clock ?? ""} onChange={(event) => setSnapshotDraft({ ...snapshotDraft, clock: event.target.value || undefined })} /></label><label><span>DOWN</span><input inputMode="numeric" value={snapshotDraft.down ?? ""} onChange={(event) => setSnapshotDraft({ ...snapshotDraft, down: scoreboardNumber(event.target.value, 1, 4) })} /></label><label><span>DISTANCE</span><input inputMode="numeric" value={snapshotDraft.distance ?? ""} onChange={(event) => setSnapshotDraft({ ...snapshotDraft, distance: scoreboardNumber(event.target.value, 1) })} /></label>
             <label><span>BALL-ON SIDE</span><select value={ballSide} onChange={(event) => setBall(event.target.value)}><option value="home">{homeCode || "Home"}</option><option value="away">{awayCode || "Away"}</option><option value="50">50</option></select></label>{ballSide !== "50" && <label><span>YARD LINE</span><input inputMode="numeric" min="1" max="49" value={ballYard} onChange={(event) => setBall(ballSide, event.target.value)} /></label>}
-            <label><span>POSSESSION</span><select value={snapshotDraft.possession ?? "home"} onChange={(event) => setSnapshotDraft({ ...snapshotDraft, possession: event.target.value as "home" | "away" })}><option value="home">{homeCode || "Home"}</option><option value="away">{awayCode || "Away"}</option></select></label><label><span>HOME SCORE</span><input inputMode="numeric" value={snapshotDraft.homeScore ?? ""} onChange={(event) => setSnapshotDraft({ ...snapshotDraft, homeScore: scoreboardNumber(event.target.value, 0) })} /></label><label><span>AWAY SCORE</span><input inputMode="numeric" value={snapshotDraft.awayScore ?? ""} onChange={(event) => setSnapshotDraft({ ...snapshotDraft, awayScore: scoreboardNumber(event.target.value, 0) })} /></label>
-          </div><div className="modal-actions"><button className="secondary-button" onClick={() => setSnapshotModal(null)}>Cancel</button><button className="primary-button" onClick={() => { if (snapshotModal === "live") setManualLive({ ...snapshotDraft, capturedAt: undefined, source: undefined }); else { setSnapshot({ ...snapshotDraft, source: snapshot?.source === "mqtt" ? "mixed" : "manual" }); changeOffense(snapshotDraft.possession ?? offense); } setSnapshotModal(null); }}>Apply Changes</button></div>
+            <label><span>OFFENSE</span><select value={snapshotDraft.possession ?? ""} onChange={(event) => setSnapshotDraft({ ...snapshotDraft, possession: event.target.value as "home" | "away" })}><option value="">Unset</option><option value="home">{homeCode || "Home"}</option><option value="away">{awayCode || "Away"}</option></select></label><label><span>HOME SCORE</span><input inputMode="numeric" value={snapshotDraft.homeScore ?? ""} onChange={(event) => setSnapshotDraft({ ...snapshotDraft, homeScore: scoreboardNumber(event.target.value, 0) })} /></label><label><span>AWAY SCORE</span><input inputMode="numeric" value={snapshotDraft.awayScore ?? ""} onChange={(event) => setSnapshotDraft({ ...snapshotDraft, awayScore: scoreboardNumber(event.target.value, 0) })} /></label>
+          </div><div className="modal-actions"><button className="secondary-button" onClick={() => setSnapshotModal(null)}>Cancel</button><button className="primary-button" onClick={() => { if (snapshotModal === "live") setManualLive({ ...snapshotDraft, capturedAt: undefined, source: undefined }); else { if (snapshotDraft.possession && snapshotDraft.possession !== snapshot?.possession) revalidatePlayers(snapshotDraft.possession); setSnapshot({ ...snapshotDraft, source: snapshot?.source === "mqtt" ? "mixed" : "manual" }); } setSnapshotModal(null); }}>Apply Changes</button></div>
         </section></div>;
       })()}
       {editing && (

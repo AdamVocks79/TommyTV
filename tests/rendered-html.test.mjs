@@ -77,6 +77,12 @@ test("keeps core interactive workflows in the product source", async () => {
   assert.match(page, /Jersey number selector/);
   assert.match(page, /All players/);
   assert.match(page, /autoSelectedJerseyPlayer/);
+  assert.match(page, /className="offense-toggle"/);
+  assert.match(page, /Toggle offense between/);
+  assert.match(page, /team: snapshot\.possession/);
+  assert.match(page, /Player selection cleared after offense changed/);
+  assert.doesNotMatch(page, /className="possession-toggle"/);
+  assert.doesNotMatch(page, /setOffense/);
   assert.doesNotMatch(page, /aria-label="More players"/);
   assert.doesNotMatch(page, /useState\(\["34"\]\)/);
   assert.match(page, /Simulate vMix push/);

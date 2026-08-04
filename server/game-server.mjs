@@ -214,7 +214,8 @@ const SPECIAL_RESULTS = {
 };
 
 function cleanPlay(body) {
-  const team = body.team === "away" ? "away" : "home";
+  if (!['home', 'away'].includes(body.team)) throw new Error("Choose the offensive team");
+  const team = body.team;
   const playType = String(body.playType || "");
   const playerNumber = String(body.playerNumber || "").trim();
   const passerNumber = String(body.passerNumber || "").trim();

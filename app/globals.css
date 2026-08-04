@@ -87,6 +87,11 @@ button { color: inherit; touch-action: manipulation; }
 .field-state.marked { background: rgba(255, 91, 46, .07); border-bottom-color: rgba(255, 91, 46, .45); }
 .field-state-values { display: grid; grid-template-columns: repeat(4, minmax(110px, 1fr)); }
 .field-state-values > div { display: grid; align-content: center; padding: 0 18px; border-right: 1px solid var(--line); }
+.offense-toggle { display: grid; align-content: center; justify-items: start; padding: 0 18px; border: 0; border-right: 1px solid var(--line); background: transparent; text-align: left; cursor: pointer; }
+.offense-toggle span { color: var(--muted); font-size: 8px; font-weight: 750; }
+.offense-toggle:hover:not(:disabled) { background: rgba(255,255,255,.035); }
+.offense-toggle:focus-visible { position: relative; outline: 2px solid var(--orange-2); outline-offset: -3px; }
+.offense-toggle:disabled { cursor: not-allowed; opacity: .65; }
 .field-state small { display: block; font-size: 9px; color: var(--muted); font-weight: 800; letter-spacing: 1.1px; }
 .field-state strong { font-size: 18px; }
 .field-state .possession { color: var(--orange-2); }
@@ -114,7 +119,6 @@ button { color: inherit; touch-action: manipulation; }
 .entry-card { padding: 18px; }
 .entry-card .panel-title { margin-bottom: 12px; }
 .entry-card .marked-entry-header { align-items: center; margin-bottom: 5px; padding-bottom: 6px; border-bottom: 1px solid var(--line); }
-.marked-entry-header + .possession-toggle { margin-bottom: 6px; }
 .marked-entry-header ~ .segmented { margin-bottom: 7px; }
 .marked-entry-header ~ .section-label { line-height: 1.35; }
 .marked-entry-header ~ .player-selection { margin-block: 3px 8px; }
@@ -128,9 +132,6 @@ h2 { margin-bottom: 0; font-size: 20px; letter-spacing: -.4px; }
 .eyebrow, .section-label { display: block; color: var(--orange-2); font-size: 9px; line-height: 1.8; letter-spacing: 1.3px; font-weight: 900; }
 .operator { padding: 7px 10px; border: 1px solid var(--line); border-radius: 7px; color: var(--muted); font-size: 9px; font-weight: 800; letter-spacing: .8px; }
 .segmented { display: grid; grid-template-columns: repeat(4, 1fr); gap: 7px; margin-bottom: 13px; }
-.possession-toggle { display: grid; grid-template-columns: 1fr 1fr; gap: 7px; margin-bottom: 9px; }
-.possession-toggle button { min-height: 44px; border: 1px solid var(--line); border-radius: 8px; background: #091a2d; color: var(--muted); font-size: 10px; font-weight: 850; letter-spacing: .4px; text-transform: uppercase; }
-.possession-toggle button.selected { border-color: var(--orange); background: rgba(255,91,46,.13); color: #fff; }
 .mark-idle { display: grid; gap: 10px; max-width: 720px; margin: 0 auto; text-align: center; }
 .snapshot-grid { display: grid; grid-template-columns: repeat(3, 1fr); gap: 8px; }
 .snapshot-grid > * { min-height: 48px; display: grid; place-items: center; padding: 8px; border: 1px solid var(--line); border-radius: 8px; background: #091a2d; font-size: 12px; }
